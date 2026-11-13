@@ -2866,6 +2866,40 @@ async fn handle_public(
     Ok(result)
 }
 
+/// `CELLD_OPERATOR_TOKEN` (Platinum patch): when set, the operator routes on
+/// the internal listener answer only a caller presenting it as
+/// `Authorization: Bearer <token>`. Unset keeps upstream's behaviour exactly.
+///
+/// Why: the operator routes authenticate no one, and the internal listener is
+/// reachable from inside the node itself — a Worker's own `fetch` to
+/// `127.0.0.1:<internal port>` reaches `/state` (every resident cell's scope)
+/// and `/do/<scope>` (any ordinary Durable Object, past the Worker's routing),
+/// and `POST /shutdown`. A private network keeps other machines out; it cannot
+/// keep out code running on the node. The peer and runtime routes are not
+/// gated here: they already verify the fleet HMAC.
+fn operator_token() -> Option<&'static [u8]> {
+    static TOKEN: std::sync::OnceLock<Option<Vec<u8>>> = std::sync::OnceLock::new();
+    TOKEN
+        .get_or_init(|| {
+            std::env::var("CELLD_OPERATOR_TOKEN")
+                .ok()
+                .filter(|token| !token.is_empty())
+                .map(String::into_bytes)
+        })
+        .as_deref()
+}
+
+fn operator_authorized(headers: &hyper::HeaderMap, expected: &[u8]) -> bool {
+    use subtle::ConstantTimeEq;
+    let Some(value) = headers.get(hyper::header::AUTHORIZATION) else {
+        return false;
+    };
+    let Some(presented) = value.as_bytes().strip_prefix(b"Bearer ") else {
+        return false;
+    };
+    presented.len() == expected.len() && bool::from(presented.ct_eq(expected))
+}
+
 async fn handle_internal(
     request: Request<Incoming>,
     app: AppHandle,
@@ -2876,6 +2910,22 @@ async fn handle_internal(
     let do_scope = path.strip_prefix("/do/");
     let cell_scope = path.strip_prefix("/cell/");
     let evict_scope = path.strip_prefix("/evict/");
+    let operator_route = matches!(
+        path.as_str(),
+        "/state" | "/reload" | "/rebalance/pause" | "/rebalance/resume" | "/shutdown"
+    ) || do_scope.is_some()
+        || cell_scope.is_some()
+        || evict_scope.is_some();
+    if operator_route {
+        if let Some(expected) = operator_token() {
+            if !operator_authorized(request.headers(), expected) {
+                return Ok(response(
+                    StatusCode::UNAUTHORIZED,
+                    "{\"error\":\"operator token required\"}",
+                ));
+            }
+        }
+    }
     let result = match path.as_str() {
         "/peer/probe" => internal_probe(request, app).await,
         "/peer/handoff" => internal_handoff(request, app).await,

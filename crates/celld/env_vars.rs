@@ -283,6 +283,7 @@ pub fn validate() -> anyhow::Result<()> {
         "CELLD_MAX_RSS_MB",
         "CELLD_MEMORY_FLOOR_MB",
         "CELLD_MEMORY_LIMIT_MB",
+        "CELLD_MEMORY_STALL_PCT",
         "CELLD_READY_FLEET_GATE_MS",
         "CELLD_REBALANCE_INTERVAL_MS",
     ] {

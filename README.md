@@ -384,7 +384,8 @@ allocator, so a memory guard backs it up. When the process holds more than
 `CELLD_MEMORY_LIMIT_MB` (resident plus swapped; default 85% of the node's
 memory and at least 384 MiB below all of it, 0 disables the guard), or while it holds at least half that and the
 machine has less than `CELLD_MEMORY_FLOOR_MB` available (default 15% of its
-memory and at least 384 MiB, 0 disables this line), running JavaScript is terminated with "Worker
+memory and at least 384 MiB, 0 disables this line), or the machine spends `CELLD_MEMORY_STALL_PCT` (default 25%) of 200 ms
+stalled on memory (PSI), running JavaScript is terminated with "Worker
 exceeded its memory limit" after a garbage collection fails to bring the
 process back under the line. If memory stays over the line for 10 seconds
 after a termination, because a Worker keeps it across requests, the node

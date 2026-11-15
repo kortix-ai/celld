@@ -31,7 +31,7 @@
 //! graceful shutdown hands its cells to peers, and the supervisor starts a
 //! fresh node, as it would after a crash, but without the kernel's kill.
 //!
-//! Two lines, either one trips the guard:
+//! Three lines, any one trips the guard:
 //! - the process holds `CELLD_MEMORY_LIMIT_MB` (default 85% of the memory the
 //!   node may use: above the shedding ceiling `CELLD_MAX_RSS_MB`, 80%; 0
 //!   disables the whole guard);
@@ -39,7 +39,11 @@
 //!   of it, at least 64 MiB; 0 disables this line): MemAvailable, or the
 //!   cgroup limit minus its working set, and only while celld holds at least
 //!   half its own line. The process line alone is blind to everything else
-//!   in the guest. Measured on a 4 GiB Dev cell: 4096 small
+//!   in the guest;
+//! - the machine spent `CELLD_MEMORY_STALL_PCT` (default 25%, 0 disables) of
+//!   the last 200 ms with every runnable task stalled on memory (PSI `full`),
+//!   also only while celld holds half its line. This is the one a 2 GiB guest
+//!   needs: zram hides the shortage from `MemAvailable` while it stalls. Measured on a 4 GiB Dev cell: 4096 small
 //!   resizable buffers got celld OOM-killed below its 90% line, because
 //!   dockerd, the agent and the kernel hold the rest.
 
@@ -58,6 +62,12 @@ const SAMPLE_INTERVAL: Duration = Duration::from_millis(10);
 /// `v8::isolate::InterruptCallback`, which the crate does not re-export.
 pub type InterruptCallback = unsafe extern "C" fn(v8::UnsafeRawIsolatePtr, *mut c_void);
 
+/// The window over which the machine's memory stall is measured (PSI "full").
+const STALL_WINDOW: Duration = Duration::from_millis(200);
+
+/// The latest stall share the sampler measured, per mille of `STALL_WINDOW`.
+static STALL_SHARE: AtomicU64 = AtomicU64::new(0);
+
 /// How long the process may stay over the line after a termination before
 /// the guard restarts it.
 pub const ESCALATE_AFTER: Duration = Duration::from_secs(10);
@@ -65,6 +75,8 @@ pub const ESCALATE_AFTER: Duration = Duration::from_secs(10);
 struct Guard {
     line: u64,
     floor: Option<u64>,
+    /// Memory-stall share (per mille of `STALL_WINDOW`) at which the guard trips.
+    stall_permille: Option<u64>,
     callback: InterruptCallback,
     isolates: Mutex<HashMap<u64, Entry>>,
     next_id: AtomicU64,
@@ -158,14 +170,17 @@ pub fn register(handle: v8::IsolateHandle, callback: InterruptCallback) -> Optio
         .get_or_init(|| {
             let line = line_from_environment()?;
             let floor = floor_from_environment();
+            let stall_permille = stall_from_environment();
             tracing::info!(
                 limit_mib = line >> 20,
                 floor_mib = floor.map(|bytes| bytes >> 20),
-                "memory guard: JavaScript is terminated while the process holds more, or the machine has less available"
+                stall_pct = stall_permille.map(|permille| permille / 10),
+                "memory guard: JavaScript is terminated while the process holds more, the machine has less available, or the machine stalls on memory"
             );
             Some(Guard {
                 line,
                 floor,
+                stall_permille,
                 callback,
                 isolates: Mutex::new(HashMap::new()),
                 next_id: AtomicU64::new(0),
@@ -216,6 +231,9 @@ pub enum Over {
     Process { held: u64, line: u64 },
     /// The machine has at most `CELLD_MEMORY_FLOOR_MB` available.
     Machine { available: u64, floor: u64 },
+    /// The machine spent at least `CELLD_MEMORY_STALL_PCT` of the last
+    /// `STALL_WINDOW` with every runnable task stalled on memory.
+    Stall { permille: u64, limit_permille: u64 },
 }
 
 impl Over {
@@ -229,6 +247,12 @@ impl Over {
                 available >> 20,
                 floor >> 20
             ),
+            Over::Stall { permille, limit_permille } => format!(
+                "the machine stalled on memory {}% of the last {} ms, the limit is {}%",
+                permille / 10,
+                STALL_WINDOW.as_millis(),
+                limit_permille / 10
+            ),
         }
     }
 }
@@ -236,21 +260,42 @@ impl Over {
 /// The line the node is over, if any.
 pub fn over_line() -> Option<Over> {
     let guard = guard()?;
-    judge(guard.line, guard.floor, process_memory_bytes(), available_bytes())
+    let stall = guard.stall_permille.map(|limit| (STALL_SHARE.load(Ordering::Relaxed), limit));
+    judge(guard.line, guard.floor, process_memory_bytes(), available_bytes(), stall)
 }
 
-/// The floor trips only while this process holds at least half its own line:
-/// a guest short of memory because of something else (a Worker's containers
-/// under dockerd) must not have every innocent request terminated, and
-/// restarting celld would free nothing there.
-fn judge(line: u64, floor: Option<u64>, held: Option<u64>, available: Option<u64>) -> Option<Over> {
+/// The floor and the stall line trip only while this process holds at least
+/// half its own line: a guest short of memory because of something else (a
+/// Worker's containers under dockerd) must not have every innocent request
+/// terminated, and restarting celld would free nothing there.
+///
+/// The stall line is the one that catches a 2 GiB guest. There, zram swaps out
+/// an attacker's compressible pages, so `MemAvailable` stays above the floor
+/// while kswapd and direct reclaim compress with zstd and every thread stalls,
+/// the lease renewal among them. On prod's cell size pt.5 fenced itself (rc=3)
+/// with neither of the other lines crossed.
+fn judge(
+    line: u64,
+    floor: Option<u64>,
+    held: Option<u64>,
+    available: Option<u64>,
+    stall: Option<(u64, u64)>,
+) -> Option<Over> {
     let held = held?;
     if held >= line {
         return Some(Over::Process { held, line });
     }
-    match (floor, available) {
-        (Some(floor), Some(available)) if available <= floor && held >= line / 2 => {
-            Some(Over::Machine { available, floor })
+    if held < line / 2 {
+        return None;
+    }
+    if let (Some(floor), Some(available)) = (floor, available) {
+        if available <= floor {
+            return Some(Over::Machine { available, floor });
+        }
+    }
+    match stall {
+        Some((permille, limit_permille)) if permille >= limit_permille => {
+            Some(Over::Stall { permille, limit_permille })
         }
         _ => None,
     }
@@ -274,6 +319,11 @@ pub fn still_over_after_collection() -> Option<Over> {
     let deadline = Instant::now() + SETTLE_WAIT;
     loop {
         let over = over_line()?;
+        // A stall is about this moment, not about garbage still to be freed:
+        // waiting would only let it run on.
+        if matches!(over, Over::Stall { .. }) {
+            return Some(over);
+        }
         if Instant::now() >= deadline {
             return Some(over);
         }
@@ -314,8 +364,23 @@ fn run_sampler() {
     let guard = guard().expect("the sampler starts only with a guard");
     let mut over_since: Option<Instant> = None;
     let mut terminations_at_crossing = 0;
+    let mut stalls: std::collections::VecDeque<(Instant, u64)> = std::collections::VecDeque::new();
     loop {
         std::thread::sleep(SAMPLE_INTERVAL);
+        if guard.stall_permille.is_some() {
+            if let Some(total) = memory_full_stall_us() {
+                let now = Instant::now();
+                stalls.push_back((now, total));
+                while stalls.len() > 2 && now.duration_since(stalls[0].0) > STALL_WINDOW {
+                    stalls.pop_front();
+                }
+                // Only a stall still going on counts: the window keeps an attack's
+                // stall for 200 ms after it ends, and the request that runs next
+                // must not inherit it.
+                let ongoing = stalls.len() >= 2 && stalls[stalls.len() - 1].1 > stalls[stalls.len() - 2].1;
+                STALL_SHARE.store(if ongoing { stall_share_permille(&stalls) } else { 0 }, Ordering::Relaxed);
+            }
+        }
         let Some(over) = over_line() else {
             over_since = None;
             continue;
@@ -382,6 +447,55 @@ fn line_from_environment() -> Option<u64> {
         Some(megabytes) => Some(megabytes.saturating_mul(1024 * 1024)),
         None => default_line(crate::machine::total_memory_bytes()),
     }
+}
+
+fn stall_from_environment() -> Option<u64> {
+    match crate::env_vars::optional::<u64>("CELLD_MEMORY_STALL_PCT")
+        .expect("validated CELLD_MEMORY_STALL_PCT")
+    {
+        Some(0) => None,
+        Some(percent) => Some(percent.min(100) * 10),
+        None => Some(DEFAULT_STALL_PERMILLE),
+    }
+}
+
+/// 25% of the window fully stalled on memory.
+const DEFAULT_STALL_PERMILLE: u64 = 250;
+
+/// The stall share across the samples (oldest to newest), per mille of the
+/// time between them.
+fn stall_share_permille(samples: &std::collections::VecDeque<(Instant, u64)>) -> u64 {
+    let (Some(first), Some(last)) = (samples.front(), samples.back()) else {
+        return 0;
+    };
+    let elapsed_us = last.0.duration_since(first.0).as_micros() as u64;
+    if elapsed_us == 0 {
+        return 0;
+    }
+    (last.1.saturating_sub(first.1).saturating_mul(1000) / elapsed_us).min(1000)
+}
+
+/// The machine's cumulative "every runnable task stalled on memory" time
+/// (PSI `full`), in microseconds.
+#[cfg(target_os = "linux")]
+#[allow(clippy::disallowed_methods)] // /proc describes this machine.
+fn memory_full_stall_us() -> Option<u64> {
+    parse_pressure_full(&std::fs::read_to_string("/proc/pressure/memory").ok()?)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn memory_full_stall_us() -> Option<u64> {
+    None
+}
+
+fn parse_pressure_full(pressure: &str) -> Option<u64> {
+    pressure
+        .lines()
+        .find(|line| line.starts_with("full "))?
+        .split_whitespace()
+        .find_map(|field| field.strip_prefix("total="))?
+        .parse::<u64>()
+        .ok()
 }
 
 fn floor_from_environment() -> Option<u64> {
@@ -532,23 +646,50 @@ mod tests {
         const MIB: u64 = 1024 * 1024;
         let line = 1843 * MIB;
         let floor = Some(204 * MIB);
-        assert_eq!(judge(line, floor, Some(1000 * MIB), Some(900 * MIB)), None);
+        assert_eq!(judge(line, floor, Some(1000 * MIB), Some(900 * MIB), None), None);
         assert_eq!(
-            judge(line, floor, Some(1900 * MIB), Some(900 * MIB)),
+            judge(line, floor, Some(1900 * MIB), Some(900 * MIB), None),
             Some(Over::Process { held: 1900 * MIB, line })
         );
         assert_eq!(
-            judge(line, floor, Some(1500 * MIB), Some(150 * MIB)),
+            judge(line, floor, Some(1500 * MIB), Some(150 * MIB), None),
             Some(Over::Machine { available: 150 * MIB, floor: 204 * MIB }),
             "the process is under its line, but the guest is out of memory"
         );
-        assert_eq!(judge(line, None, Some(1500 * MIB), Some(1)), None, "floor disabled");
+        assert_eq!(judge(line, None, Some(1500 * MIB), Some(1), None), None, "floor disabled");
         assert_eq!(
-            judge(line, floor, Some(300 * MIB), Some(150 * MIB)),
+            judge(line, floor, Some(300 * MIB), Some(150 * MIB), None),
             None,
             "the guest is short, but celld holds little of it (a Worker's containers): not celld's to fix"
         );
-        assert_eq!(judge(line, floor, None, Some(1)), None, "nothing readable: nothing to blame");
+        assert_eq!(judge(line, floor, None, Some(1), None), None, "nothing readable: nothing to blame");
+    }
+
+    #[test]
+    fn a_machine_stalled_on_memory_trips_the_guard_while_celld_holds_half_its_line() {
+        const MIB: u64 = 1024 * 1024;
+        let line = 1582 * MIB;
+        let plenty = Some(900 * MIB);
+        assert_eq!(
+            judge(line, None, Some(900 * MIB), plenty, Some((400, 250))),
+            Some(Over::Stall { permille: 400, limit_permille: 250 }),
+            "zram keeps MemAvailable up while every task stalls"
+        );
+        assert_eq!(judge(line, None, Some(900 * MIB), plenty, Some((100, 250))), None, "a light stall is not a trip");
+        assert_eq!(judge(line, None, Some(300 * MIB), plenty, Some((900, 250))), None, "stalled, but not by celld");
+        assert_eq!(judge(line, None, Some(900 * MIB), plenty, None), None, "stall line disabled");
+    }
+
+    #[test]
+    fn the_stall_share_and_psi_full_total_are_read_right() {
+        let t0 = Instant::now();
+        let samples: std::collections::VecDeque<(Instant, u64)> =
+            [(t0, 1_000_000), (t0 + Duration::from_millis(200), 1_080_000)].into_iter().collect();
+        assert_eq!(stall_share_permille(&samples), 400, "80 ms stalled of 200 ms");
+        assert_eq!(stall_share_permille(&std::collections::VecDeque::new()), 0);
+        let psi = "some avg10=0.00 avg60=0.00 avg300=0.00 total=75157541\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=75124789\n";
+        assert_eq!(parse_pressure_full(psi), Some(75124789));
+        assert_eq!(parse_pressure_full("some avg10=0.00 total=1\n"), None);
     }
 
     #[test]

@@ -368,6 +368,7 @@ TUNING:
   CELLD_ARRAY_BUFFER_LIMIT_MB     ArrayBuffer memory, whole process (default: half of memory)
   CELLD_MEMORY_LIMIT_MB           Process memory past which running JS is terminated (default: 85%, 384 MiB below all; 0 disables)
   CELLD_MEMORY_FLOOR_MB           Machine memory available below which it is too (default: 15%, at least 384 MiB; 0 disables)
+  CELLD_MEMORY_STALL_PCT          Share of 200 ms the machine may stall on memory before it is too (default: 25; 0 disables)
   CELLD_FETCH_TIMEOUT_S           Outbound fetch timeout
   CELLD_HANDLER_BUDGET_S          JavaScript handler budget
   CELLD_TOKIO_THREADS             Tokio runtime worker threads

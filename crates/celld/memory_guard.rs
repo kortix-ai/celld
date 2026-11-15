@@ -11,7 +11,7 @@
 //! many small ones.
 //!
 //! This guard is the backstop for those and for anything else. A thread reads
-//! the process's resident plus swapped memory every 25 ms. Above the line it
+//! the process's resident plus swapped memory every 10 ms. Above the line it
 //! asks every isolate for an interrupt, again every 50 ms while the process
 //! stays over: V8 keeps interrupt flags in per-thread state, and an isolate
 //! that moves between threads under its `Locker` can lose a flag set while
@@ -32,10 +32,10 @@
 //! fresh node, as it would after a crash, but without the kernel's kill.
 //!
 //! Two lines, either one trips the guard:
-//! - the process holds `CELLD_MEMORY_LIMIT_MB` (default 90% of the memory the
+//! - the process holds `CELLD_MEMORY_LIMIT_MB` (default 85% of the memory the
 //!   node may use: above the shedding ceiling `CELLD_MAX_RSS_MB`, 80%; 0
 //!   disables the whole guard);
-//! - the machine has less than `CELLD_MEMORY_FLOOR_MB` available (default 10%
+//! - the machine has less than `CELLD_MEMORY_FLOOR_MB` available (default 15%
 //!   of it, at least 64 MiB; 0 disables this line): MemAvailable, or the
 //!   cgroup limit minus its working set, and only while celld holds at least
 //!   half its own line. The process line alone is blind to everything else
@@ -49,7 +49,11 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Once, OnceLock};
 use std::time::{Duration, Instant};
 
-const SAMPLE_INTERVAL: Duration = Duration::from_millis(25);
+/// 10 ms: a fill grows a process by 2-5 GB/s, and a real guest has a few
+/// hundred MiB between the guard's lines and the kernel's OOM kill. At 25 ms
+/// one Dev attack in four still won that race. Reading /proc twice per sample
+/// costs about 0.25% of one core.
+const SAMPLE_INTERVAL: Duration = Duration::from_millis(10);
 
 /// `v8::isolate::InterruptCallback`, which the crate does not re-export.
 pub type InterruptCallback = unsafe extern "C" fn(v8::UnsafeRawIsolatePtr, *mut c_void);
@@ -365,11 +369,11 @@ fn floor_from_environment() -> Option<u64> {
     }
 }
 
-/// 10% of the node's memory, never under 64 MiB.
+/// 15% of the node's memory, never under 64 MiB.
 fn default_floor(total_memory_bytes: Option<u64>) -> Option<u64> {
     total_memory_bytes
         .filter(|bytes| *bytes > 0)
-        .map(|bytes| (bytes / 10).max(64 * 1024 * 1024))
+        .map(|bytes| (bytes / 100 * 15).max(64 * 1024 * 1024))
 }
 
 /// What the machine has left: the cgroup limit less its working set when the
@@ -400,10 +404,12 @@ fn parse_meminfo_available(meminfo: &str) -> Option<u64> {
         .map(|kb| kb.saturating_mul(1024))
 }
 
+/// 85% of the node's memory. 90% left too little room on a real guest (see
+/// `SAMPLE_INTERVAL`).
 fn default_line(total_memory_bytes: Option<u64>) -> Option<u64> {
     total_memory_bytes
         .filter(|bytes| *bytes > 0)
-        .map(|bytes| bytes / 10 * 9)
+        .map(|bytes| bytes / 100 * 85)
 }
 
 /// Resident plus swapped memory of this process. Swapped pages count: in a
@@ -447,8 +453,8 @@ mod tests {
     }
 
     #[test]
-    fn the_default_line_is_ninety_percent_of_the_node() {
-        assert_eq!(default_line(Some(2 * 1024 * 1024 * 1024)), Some(1932735276));
+    fn the_default_line_is_eighty_five_percent_of_the_node() {
+        assert_eq!(default_line(Some(2 * 1024 * 1024 * 1024)), Some(2147483648 / 100 * 85));
         assert_eq!(default_line(None), None, "unknown memory size: no guard");
         assert_eq!(default_line(Some(0)), None);
     }
@@ -511,8 +517,8 @@ mod tests {
     }
 
     #[test]
-    fn the_default_floor_is_ten_percent_and_at_least_64_mib() {
-        assert_eq!(default_floor(Some(4096 * 1024 * 1024)), Some(4096 * 1024 * 1024 / 10));
+    fn the_default_floor_is_fifteen_percent_and_at_least_64_mib() {
+        assert_eq!(default_floor(Some(4096 * 1024 * 1024)), Some(4096 * 1024 * 1024 / 100 * 15));
         assert_eq!(default_floor(Some(256 * 1024 * 1024)), Some(64 * 1024 * 1024));
         assert_eq!(default_floor(None), None);
     }

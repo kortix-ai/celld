@@ -367,6 +367,7 @@ TUNING:
   CELLD_V8_HEAP_LIMIT_MB          Per-isolate V8 heap limit
   CELLD_ARRAY_BUFFER_LIMIT_MB     ArrayBuffer memory, whole process (default: half of memory)
   CELLD_MEMORY_LIMIT_MB           Process memory past which running JS is terminated (default: 90%; 0 disables)
+  CELLD_MEMORY_FLOOR_MB           Machine memory available below which it is too (default: 10%; 0 disables)
   CELLD_FETCH_TIMEOUT_S           Outbound fetch timeout
   CELLD_HANDLER_BUDGET_S          JavaScript handler budget
   CELLD_TOKIO_THREADS             Tokio runtime worker threads

@@ -2941,7 +2941,7 @@ unsafe extern "C" fn memory_guard_interrupt(raw: v8::UnsafeRawIsolatePtr, data: 
         return;
     }
     isolate.low_memory_notification();
-    let Some((held, line)) = crate::memory_guard::still_over_after_collection() else {
+    let Some(over) = crate::memory_guard::still_over_after_collection() else {
         return;
     };
     let mut termination = state.termination.lock().expect("termination lock poisoned");
@@ -2949,22 +2949,16 @@ unsafe extern "C" fn memory_guard_interrupt(raw: v8::UnsafeRawIsolatePtr, data: 
         return;
     }
     *termination = Some(ExecutionTermination {
-        error: format!(
-            "{}: the node holds {} MiB, the limit is {} MiB",
-            crate::memory_guard::LIMIT_ERROR,
-            held >> 20,
-            line >> 20
-        ),
+        error: format!("{}: {}", crate::memory_guard::LIMIT_ERROR, over.describe()),
         actor_scope: None,
         context_id: None,
     });
     drop(termination);
     crate::memory_guard::record_termination();
     tracing::warn!(
-        held_bytes = held,
-        line_bytes = line,
+        pressure = %over.describe(),
         script = %state.script_name,
-        "memory guard: terminating JavaScript, the process is over CELLD_MEMORY_LIMIT_MB"
+        "memory guard: terminating JavaScript, the node is over its memory line"
     );
     isolate.terminate_execution();
 }

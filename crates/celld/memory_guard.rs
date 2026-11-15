@@ -31,9 +31,17 @@
 //! graceful shutdown hands its cells to peers, and the supervisor starts a
 //! fresh node, as it would after a crash, but without the kernel's kill.
 //!
-//! `CELLD_MEMORY_LIMIT_MB` sets the line (0 disables the guard). The default
-//! is 90% of the memory the node may use: above the shedding ceiling
-//! (`CELLD_MAX_RSS_MB`, 80%), below where the kernel kills the process.
+//! Two lines, either one trips the guard:
+//! - the process holds `CELLD_MEMORY_LIMIT_MB` (default 90% of the memory the
+//!   node may use: above the shedding ceiling `CELLD_MAX_RSS_MB`, 80%; 0
+//!   disables the whole guard);
+//! - the machine has less than `CELLD_MEMORY_FLOOR_MB` available (default 10%
+//!   of it, at least 64 MiB; 0 disables this line): MemAvailable, or the
+//!   cgroup limit minus its working set, and only while celld holds at least
+//!   half its own line. The process line alone is blind to everything else
+//!   in the guest. Measured on a 4 GiB Dev cell: 4096 small
+//!   resizable buffers got celld OOM-killed below its 90% line, because
+//!   dockerd, the agent and the kernel hold the rest.
 
 use std::collections::HashMap;
 use std::ffi::c_void;
@@ -52,6 +60,7 @@ pub const ESCALATE_AFTER: Duration = Duration::from_secs(10);
 
 struct Guard {
     line: u64,
+    floor: Option<u64>,
     callback: InterruptCallback,
     isolates: Mutex<HashMap<u64, Entry>>,
     next_id: AtomicU64,
@@ -144,12 +153,15 @@ pub fn register(handle: v8::IsolateHandle, callback: InterruptCallback) -> Optio
     let guard = GUARD
         .get_or_init(|| {
             let line = line_from_environment()?;
+            let floor = floor_from_environment();
             tracing::info!(
                 limit_mib = line >> 20,
-                "memory guard: JavaScript running while the process holds more is terminated"
+                floor_mib = floor.map(|bytes| bytes >> 20),
+                "memory guard: JavaScript is terminated while the process holds more, or the machine has less available"
             );
             Some(Guard {
                 line,
+                floor,
                 callback,
                 isolates: Mutex::new(HashMap::new()),
                 next_id: AtomicU64::new(0),
@@ -193,11 +205,51 @@ pub unsafe fn interrupt_taken(data: *mut c_void) -> Option<Check> {
     Some(Check { shared })
 }
 
-/// `(held, line)` when the process holds at least the line, else `None`.
-pub fn over_line() -> Option<(u64, u64)> {
-    let line = guard()?.line;
-    let held = process_memory_bytes()?;
-    (held >= line).then_some((held, line))
+/// Which line the node is over.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Over {
+    /// The process holds at least `CELLD_MEMORY_LIMIT_MB`.
+    Process { held: u64, line: u64 },
+    /// The machine has at most `CELLD_MEMORY_FLOOR_MB` available.
+    Machine { available: u64, floor: u64 },
+}
+
+impl Over {
+    pub fn describe(&self) -> String {
+        match *self {
+            Over::Process { held, line } => {
+                format!("the node holds {} MiB, the limit is {} MiB", held >> 20, line >> 20)
+            }
+            Over::Machine { available, floor } => format!(
+                "the machine has {} MiB available, the floor is {} MiB",
+                available >> 20,
+                floor >> 20
+            ),
+        }
+    }
+}
+
+/// The line the node is over, if any.
+pub fn over_line() -> Option<Over> {
+    let guard = guard()?;
+    judge(guard.line, guard.floor, process_memory_bytes(), available_bytes())
+}
+
+/// The floor trips only while this process holds at least half its own line:
+/// a guest short of memory because of something else (a Worker's containers
+/// under dockerd) must not have every innocent request terminated, and
+/// restarting celld would free nothing there.
+fn judge(line: u64, floor: Option<u64>, held: Option<u64>, available: Option<u64>) -> Option<Over> {
+    let held = held?;
+    if held >= line {
+        return Some(Over::Process { held, line });
+    }
+    match (floor, available) {
+        (Some(floor), Some(available)) if available <= floor && held >= line / 2 => {
+            Some(Over::Machine { available, floor })
+        }
+        _ => None,
+    }
 }
 
 /// After the interrupt's garbage collection: `(held, line)` if the process is
@@ -213,7 +265,7 @@ pub fn over_line() -> Option<(u64, u64)> {
 ///
 /// No `malloc_trim` here: tried, and in a guest at its memory limit with
 /// zram it walked swapped heap on every interrupt and stalled the node.
-pub fn still_over_after_collection() -> Option<(u64, u64)> {
+pub fn still_over_after_collection() -> Option<Over> {
     let deadline = Instant::now() + SETTLE_WAIT;
     loop {
         let over = over_line()?;
@@ -235,13 +287,10 @@ fn run_sampler() {
     let mut terminations_at_crossing = 0;
     loop {
         std::thread::sleep(SAMPLE_INTERVAL);
-        let Some(held) = process_memory_bytes() else {
-            continue;
-        };
-        if held < guard.line {
+        let Some(over) = over_line() else {
             over_since = None;
             continue;
-        }
+        };
         let now = Instant::now();
         let since = *over_since.get_or_insert_with(|| {
             terminations_at_crossing = TERMINATIONS.load(Ordering::Relaxed);
@@ -252,9 +301,8 @@ fn run_sampler() {
             && !ESCALATED.swap(true, Ordering::Relaxed)
         {
             tracing::error!(
-                held_bytes = held,
-                line_bytes = guard.line,
-                "memory guard: the process stayed over CELLD_MEMORY_LIMIT_MB after terminating \
+                pressure = %over.describe(),
+                "memory guard: the node stayed over its memory line after terminating \
                  JavaScript, so memory is held across requests; shutting down for a restart"
             );
             // SAFETY: raising a signal at our own process; celld's handler
@@ -305,6 +353,51 @@ fn line_from_environment() -> Option<u64> {
         Some(megabytes) => Some(megabytes.saturating_mul(1024 * 1024)),
         None => default_line(crate::machine::total_memory_bytes()),
     }
+}
+
+fn floor_from_environment() -> Option<u64> {
+    match crate::env_vars::optional::<u64>("CELLD_MEMORY_FLOOR_MB")
+        .expect("validated CELLD_MEMORY_FLOOR_MB")
+    {
+        Some(0) => None,
+        Some(megabytes) => Some(megabytes.saturating_mul(1024 * 1024)),
+        None => default_floor(crate::machine::total_memory_bytes()),
+    }
+}
+
+/// 10% of the node's memory, never under 64 MiB.
+fn default_floor(total_memory_bytes: Option<u64>) -> Option<u64> {
+    total_memory_bytes
+        .filter(|bytes| *bytes > 0)
+        .map(|bytes| (bytes / 10).max(64 * 1024 * 1024))
+}
+
+/// What the machine has left: the cgroup limit less its working set when the
+/// node runs under one, otherwise the kernel's MemAvailable.
+#[cfg(target_os = "linux")]
+#[allow(clippy::disallowed_methods)] // /proc describes this machine.
+fn available_bytes() -> Option<u64> {
+    if let Some(limit) = crate::memory::cgroup_limit_bytes() {
+        let working_set = crate::memory::sample().cgroup_working_set_bytes?;
+        return Some(limit.saturating_sub(working_set));
+    }
+    parse_meminfo_available(&std::fs::read_to_string("/proc/meminfo").ok()?)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn available_bytes() -> Option<u64> {
+    None
+}
+
+fn parse_meminfo_available(meminfo: &str) -> Option<u64> {
+    meminfo
+        .lines()
+        .find_map(|line| line.strip_prefix("MemAvailable:"))?
+        .split_whitespace()
+        .next()?
+        .parse::<u64>()
+        .ok()
+        .map(|kb| kb.saturating_mul(1024))
 }
 
 fn default_line(total_memory_bytes: Option<u64>) -> Option<u64> {
@@ -391,6 +484,44 @@ mod tests {
         assert!(!shared.checking.load(Ordering::Acquire));
         assert_eq!(shared.outstanding.load(Ordering::Acquire), 0);
         assert_eq!(Arc::strong_count(&shared), 1, "every reference handed to V8 came back");
+    }
+
+    #[test]
+    fn either_line_trips_the_guard() {
+        const MIB: u64 = 1024 * 1024;
+        let line = 1843 * MIB;
+        let floor = Some(204 * MIB);
+        assert_eq!(judge(line, floor, Some(1000 * MIB), Some(900 * MIB)), None);
+        assert_eq!(
+            judge(line, floor, Some(1900 * MIB), Some(900 * MIB)),
+            Some(Over::Process { held: 1900 * MIB, line })
+        );
+        assert_eq!(
+            judge(line, floor, Some(1500 * MIB), Some(150 * MIB)),
+            Some(Over::Machine { available: 150 * MIB, floor: 204 * MIB }),
+            "the process is under its line, but the guest is out of memory"
+        );
+        assert_eq!(judge(line, None, Some(1500 * MIB), Some(1)), None, "floor disabled");
+        assert_eq!(
+            judge(line, floor, Some(300 * MIB), Some(150 * MIB)),
+            None,
+            "the guest is short, but celld holds little of it (a Worker's containers): not celld's to fix"
+        );
+        assert_eq!(judge(line, floor, None, Some(1)), None, "nothing readable: nothing to blame");
+    }
+
+    #[test]
+    fn the_default_floor_is_ten_percent_and_at_least_64_mib() {
+        assert_eq!(default_floor(Some(4096 * 1024 * 1024)), Some(4096 * 1024 * 1024 / 10));
+        assert_eq!(default_floor(Some(256 * 1024 * 1024)), Some(64 * 1024 * 1024));
+        assert_eq!(default_floor(None), None);
+    }
+
+    #[test]
+    fn mem_available_is_read_from_meminfo() {
+        let meminfo = "MemTotal:        4016000 kB\nMemFree:          100000 kB\nMemAvailable:     2048000 kB\n";
+        assert_eq!(parse_meminfo_available(meminfo), Some(2048000 * 1024));
+        assert_eq!(parse_meminfo_available("MemTotal: 1 kB\n"), None);
     }
 
     #[test]

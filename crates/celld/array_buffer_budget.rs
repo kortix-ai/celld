@@ -176,13 +176,43 @@ pub fn allocator() -> v8::UniqueRef<v8::Allocator> {
     unsafe { v8::new_rust_allocator(budget() as *const Budget, &VTABLE) }
 }
 
+/// ArrayBuffers this large get pages of their own (`mmap`/`munmap`) instead of
+/// `malloc`. glibc keeps freed blocks this size inside its heap, because its
+/// mmap threshold grows to the largest block freed. So after a refused 1 GiB
+/// of 1 MiB arrays, the process still held the gigabyte. Measured on a 2 GiB
+/// Dev cell: the next attack started from there, and the guest thrashed in zram
+/// past its lease before the memory guard could act. `munmap` returns the
+/// pages the moment V8 frees the buffer. V8 passes `Free` the length it gave
+/// `Allocate` (the `ArrayBuffer::Allocator` contract), so the length alone
+/// says which path a buffer took.
+pub const OWN_PAGES_BYTES: usize = 256 * 1024;
+
+fn own_pages(len: usize) -> *mut c_void {
+    // Anonymous private pages read as zero, so this serves both entry points.
+    let data = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            len,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+            -1,
+            0,
+        )
+    };
+    if data == libc::MAP_FAILED {
+        std::ptr::null_mut()
+    } else {
+        data
+    }
+}
+
 unsafe extern "C" fn allocate(budget: &Budget, len: usize) -> *mut c_void {
     if !budget.reserve(len) {
         return std::ptr::null_mut();
     }
     // Zeroed, as V8's default allocator hands out (`calloc`). One byte for an
     // empty buffer, so the pointer is never null for a granted request.
-    let data = unsafe { libc::calloc(len.max(1), 1) };
+    let data = if len >= OWN_PAGES_BYTES { own_pages(len) } else { unsafe { libc::calloc(len.max(1), 1) } };
     if data.is_null() {
         budget.release(len);
     }
@@ -193,7 +223,7 @@ unsafe extern "C" fn allocate_uninitialized(budget: &Budget, len: usize) -> *mut
     if !budget.reserve(len) {
         return std::ptr::null_mut();
     }
-    let data = unsafe { libc::malloc(len.max(1)) };
+    let data = if len >= OWN_PAGES_BYTES { own_pages(len) } else { unsafe { libc::malloc(len.max(1)) } };
     if data.is_null() {
         budget.release(len);
     }
@@ -201,7 +231,11 @@ unsafe extern "C" fn allocate_uninitialized(budget: &Budget, len: usize) -> *mut
 }
 
 unsafe extern "C" fn free(budget: &Budget, data: *mut c_void, len: usize) {
-    unsafe { libc::free(data) };
+    if len >= OWN_PAGES_BYTES {
+        unsafe { libc::munmap(data, len) };
+    } else {
+        unsafe { libc::free(data) };
+    }
     budget.release(len);
 }
 
@@ -327,6 +361,27 @@ mod tests {
         }
         assert_eq!(granted.load(Ordering::Relaxed), 64);
         assert_eq!(budget.used(), 64 * MIB);
+    }
+
+    #[test]
+    fn large_buffers_get_pages_of_their_own_zeroed_and_given_back() {
+        let budget = Budget::new(64 * MIB);
+        for len in [OWN_PAGES_BYTES - 1, OWN_PAGES_BYTES, 4 * MIB] {
+            for zeroed in [true, false] {
+                let data = unsafe {
+                    if zeroed { allocate(&budget, len) } else { allocate_uninitialized(&budget, len) }
+                } as *mut u8;
+                assert!(!data.is_null(), "len {len}");
+                let bytes = unsafe { std::slice::from_raw_parts_mut(data, len) };
+                if zeroed || len >= OWN_PAGES_BYTES {
+                    assert!(bytes.iter().all(|b| *b == 0), "len {len} reads as zero");
+                }
+                bytes.fill(7);
+                assert_eq!(budget.used(), len);
+                unsafe { free(&budget, data.cast(), len) };
+                assert_eq!(budget.used(), 0);
+            }
+        }
     }
 
     #[test]

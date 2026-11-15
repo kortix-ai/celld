@@ -270,6 +270,7 @@ fn judge(line: u64, floor: Option<u64>, held: Option<u64>, available: Option<u64
 /// No `malloc_trim` here: tried, and in a guest at its memory limit with
 /// zram it walked swapped heap on every interrupt and stalled the node.
 pub fn still_over_after_collection() -> Option<Over> {
+    purge_allocator();
     let deadline = Instant::now() + SETTLE_WAIT;
     loop {
         let over = over_line()?;
@@ -277,6 +278,30 @@ pub fn still_over_after_collection() -> Option<Over> {
             return Some(over);
         }
         std::thread::sleep(SETTLE_POLL);
+    }
+}
+
+/// Give jemalloc's dirty pages back to the kernel now. It keeps freed pages for
+/// `dirty_decay_ms` (10 s), and bytes celld hands to JavaScript (fetch bodies,
+/// storage reads) live in Rust Vecs, so a terminated request's buffers sat in
+/// the allocator for that long and kept the process over the line. Setting an
+/// arena's decay times to 0 purges it at once (madvise on jemalloc's own
+/// extent records, nothing swapped back in); the old times are put back.
+fn purge_allocator() {
+    let Ok(arenas) = tikv_jemalloc_ctl::arenas::narenas::read() else {
+        return;
+    };
+    for arena in 0..arenas {
+        for knob in ["dirty_decay_ms", "muzzy_decay_ms"] {
+            let name = format!("arena.{arena}.{knob}\0");
+            // SAFETY: an ssize_t mallctl, read and written with its own type.
+            unsafe {
+                if let Ok(old) = tikv_jemalloc_ctl::raw::read::<isize>(name.as_bytes()) {
+                    let _ = tikv_jemalloc_ctl::raw::write(name.as_bytes(), 0_isize);
+                    let _ = tikv_jemalloc_ctl::raw::write(name.as_bytes(), old);
+                }
+            }
+        }
     }
 }
 
@@ -369,11 +394,17 @@ fn floor_from_environment() -> Option<u64> {
     }
 }
 
-/// 15% of the node's memory, never under 64 MiB.
+/// What the rest of a guest holds whatever its size: dockerd, the in-VM agent,
+/// the kernel. About 300 MiB on a Platinum cell. On a 2 GiB cell, 85%/15%
+/// left too little of it: the guest thrashed in zram before either line.
+const RESERVE_BYTES: u64 = 384 * 1024 * 1024;
+
+/// 15% of the node's memory, and at least `RESERVE_BYTES`, but never more
+/// than half.
 fn default_floor(total_memory_bytes: Option<u64>) -> Option<u64> {
     total_memory_bytes
         .filter(|bytes| *bytes > 0)
-        .map(|bytes| (bytes / 100 * 15).max(64 * 1024 * 1024))
+        .map(|bytes| (bytes / 100 * 15).max(RESERVE_BYTES).min(bytes / 2))
 }
 
 /// What the machine has left: the cgroup limit less its working set when the
@@ -404,12 +435,13 @@ fn parse_meminfo_available(meminfo: &str) -> Option<u64> {
         .map(|kb| kb.saturating_mul(1024))
 }
 
-/// 85% of the node's memory. 90% left too little room on a real guest (see
-/// `SAMPLE_INTERVAL`).
+/// 85% of the node's memory, and at least `RESERVE_BYTES` below all of it,
+/// but never under half. 90% left too little room on a real guest (see
+/// `SAMPLE_INTERVAL`), and 85% too little on a 2 GiB one.
 fn default_line(total_memory_bytes: Option<u64>) -> Option<u64> {
     total_memory_bytes
         .filter(|bytes| *bytes > 0)
-        .map(|bytes| bytes / 100 * 85)
+        .map(|bytes| (bytes / 100 * 85).min(bytes.saturating_sub(RESERVE_BYTES)).max(bytes / 2))
 }
 
 /// Resident plus swapped memory of this process. Swapped pages count: in a
@@ -453,8 +485,11 @@ mod tests {
     }
 
     #[test]
-    fn the_default_line_is_eighty_five_percent_of_the_node() {
-        assert_eq!(default_line(Some(2 * 1024 * 1024 * 1024)), Some(2147483648 / 100 * 85));
+    fn the_default_line_is_eighty_five_percent_of_the_node_with_a_reserve() {
+        const MIB: u64 = 1024 * 1024;
+        assert_eq!(default_line(Some(4096 * MIB)), Some(4096 * MIB / 100 * 85), "big: 85%");
+        assert_eq!(default_line(Some(1966 * MIB)), Some(1966 * MIB - 384 * MIB), "a 2 GiB cell keeps 384 MiB");
+        assert_eq!(default_line(Some(512 * MIB)), Some(256 * MIB), "never under half");
         assert_eq!(default_line(None), None, "unknown memory size: no guard");
         assert_eq!(default_line(Some(0)), None);
     }
@@ -517,9 +552,11 @@ mod tests {
     }
 
     #[test]
-    fn the_default_floor_is_fifteen_percent_and_at_least_64_mib() {
-        assert_eq!(default_floor(Some(4096 * 1024 * 1024)), Some(4096 * 1024 * 1024 / 100 * 15));
-        assert_eq!(default_floor(Some(256 * 1024 * 1024)), Some(64 * 1024 * 1024));
+    fn the_default_floor_is_fifteen_percent_and_at_least_the_reserve() {
+        const MIB: u64 = 1024 * 1024;
+        assert_eq!(default_floor(Some(4096 * MIB)), Some(4096 * MIB / 100 * 15));
+        assert_eq!(default_floor(Some(1966 * MIB)), Some(384 * MIB), "a 2 GiB cell: the reserve");
+        assert_eq!(default_floor(Some(512 * MIB)), Some(256 * MIB), "never over half");
         assert_eq!(default_floor(None), None);
     }
 

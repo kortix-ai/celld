@@ -370,6 +370,24 @@ WebSocket client holds state in the heap, so the limit decides how many
 clients a cell can carry: approximately 50,000 at the default, and
 approximately 512 MB for 100,000.
 
+ArrayBuffer memory is outside the V8 heap, so the heap limit does not bound
+it. A separate budget does: every isolate in the process shares
+`CELLD_ARRAY_BUFFER_LIMIT_MB`, which defaults to half of the memory the node
+may use (its cgroup limit, otherwise physical memory). The allocation that
+would cross the budget throws `RangeError: Array buffer allocation failed`,
+and an async result that would cross it (a fetch body, a storage read)
+rejects with the same error, so one request cannot swap the node into
+missing its lease.
+
+Resizable ArrayBuffers and WebAssembly memory do not go through that
+allocator, so a memory guard backs it up. When the process holds more than
+`CELLD_MEMORY_LIMIT_MB` (resident plus swapped; default 90% of the node's
+memory, 0 disables it), running JavaScript is terminated with "Worker
+exceeded its memory limit" after a garbage collection fails to bring the
+process back under the line. If memory stays over the line for 10 seconds
+after a termination, because a Worker keeps it across requests, the node
+shuts down gracefully so its supervisor can start a fresh one.
+
 An isolate above 90% of this limit refuses a new hibernatable WebSocket, and
 it accepts again when the use of the heap falls under 90%. An isolate that
 reaches the limit also stops the materialization of a SQL result set; both

@@ -281,6 +281,7 @@ pub fn validate() -> anyhow::Result<()> {
         "CELLD_LOG_WINDOW_BYTES",
         "CELLD_MAX_RESIDENT_CELLS",
         "CELLD_MAX_RSS_MB",
+        "CELLD_MEMORY_LIMIT_MB",
         "CELLD_READY_FLEET_GATE_MS",
         "CELLD_REBALANCE_INTERVAL_MS",
     ] {
@@ -300,6 +301,12 @@ pub fn validate() -> anyhow::Result<()> {
     if let Some(megabytes) = positive::<usize>("CELLD_V8_HEAP_LIMIT_MB")? {
         if megabytes.checked_mul(1024 * 1024).is_none() {
             bail!("CELLD_V8_HEAP_LIMIT_MB is too large: {megabytes}");
+        }
+    }
+
+    if let Some(megabytes) = positive::<usize>("CELLD_ARRAY_BUFFER_LIMIT_MB")? {
+        if megabytes.checked_mul(1024 * 1024).is_none() {
+            bail!("CELLD_ARRAY_BUFFER_LIMIT_MB is too large: {megabytes}");
         }
     }
 

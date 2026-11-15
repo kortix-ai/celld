@@ -21,6 +21,7 @@ mod conformance_core_loop_tests {
 mod conformance_facet_failure_tests {
     include!(env!("CELLD_CONFORMANCE_FACET_FAILURE_TESTS"));
 }
+pub mod array_buffer_budget;
 pub mod assets;
 #[cfg(not(celld_internal_tests))]
 pub mod asyncrt;
@@ -76,6 +77,7 @@ pub mod ltx_repl;
 pub mod ltx_replication;
 pub mod machine;
 pub mod memory;
+pub mod memory_guard;
 pub mod node_log;
 pub(crate) mod operator_cell;
 #[doc(hidden)]

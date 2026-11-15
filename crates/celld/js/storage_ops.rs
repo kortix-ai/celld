@@ -611,7 +611,12 @@ fn sql_value_to_v8<'s>(
             if bytes.is_empty() {
                 return v8::ArrayBuffer::new(scope, 0).into();
             }
-            let store = v8::ArrayBuffer::new_backing_store_from_vec(bytes).make_shared();
+            let store = crate::array_buffer_budget::backing_store_from_vec(
+                bytes,
+                crate::array_buffer_budget::Admission::Charged,
+            )
+            .expect("a charged backing store is never refused")
+            .make_shared();
             v8::ArrayBuffer::with_backing_store(scope, &store).into()
         }
     }

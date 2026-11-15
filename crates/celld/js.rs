@@ -1407,10 +1407,16 @@ fn resolve_res(tc: &mut v8::PinScope, id: u64, res: Result<asyncrt::OpOut, Strin
             let s = v8::String::new(tc, &v).unwrap();
             r.resolve(tc, s.into());
         }
-        Ok(asyncrt::OpOut::Bytes(b)) => {
-            let v = bytes_value(tc, b);
-            r.resolve(tc, v);
-        }
+        Ok(asyncrt::OpOut::Bytes(b)) => match refusable_bytes_value(tc, b) {
+            Some(v) => {
+                r.resolve(tc, v);
+            }
+            None => {
+                let s = v8::String::new(tc, crate::array_buffer_budget::REFUSAL_MESSAGE).unwrap();
+                let ex = v8::Exception::range_error(tc, s);
+                r.reject(tc, ex);
+            }
+        },
         Err(e) => {
             let s = v8::String::new(tc, &e).unwrap();
             let ex = v8::Exception::error(tc, s);
@@ -1419,12 +1425,32 @@ fn resolve_res(tc: &mut v8::PinScope, id: u64, res: Result<asyncrt::OpOut, Strin
     }
 }
 
-/// Move `bytes` into a `Uint8Array` without copying.
+/// Move `bytes` into a `Uint8Array` without copying. The bytes are charged to
+/// the process ArrayBuffer budget but never refused: the routes that call this
+/// bound their sizes themselves.
 fn bytes_value<'s>(scope: &mut v8::PinScope<'s, '_>, bytes: Vec<u8>) -> v8::Local<'s, v8::Value> {
+    budgeted_bytes_value(scope, bytes, crate::array_buffer_budget::Admission::Charged)
+        .expect("a charged backing store is never refused")
+}
+
+/// [`bytes_value`] for an async op's result (a fetch body, a storage read):
+/// `None` when the process ArrayBuffer budget refuses it.
+fn refusable_bytes_value<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    bytes: Vec<u8>,
+) -> Option<v8::Local<'s, v8::Value>> {
+    budgeted_bytes_value(scope, bytes, crate::array_buffer_budget::Admission::Refusable)
+}
+
+fn budgeted_bytes_value<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    bytes: Vec<u8>,
+    admission: crate::array_buffer_budget::Admission,
+) -> Option<v8::Local<'s, v8::Value>> {
     #[cfg(celld_internal_tests)]
     let input = bytes.as_ptr() as usize;
     let len = bytes.len();
-    let store = v8::ArrayBuffer::new_backing_store_from_vec(bytes).make_shared();
+    let store = crate::array_buffer_budget::backing_store_from_vec(bytes, admission)?.make_shared();
     let buffer = v8::ArrayBuffer::with_backing_store(scope, &store);
     #[cfg(celld_internal_tests)]
     record_bytes_value_allocation_for_test(
@@ -1434,7 +1460,7 @@ fn bytes_value<'s>(scope: &mut v8::PinScope<'s, '_>, bytes: Vec<u8>) -> v8::Loca
             .data()
             .map(|data| data.as_ptr() as usize),
     );
-    v8::Uint8Array::new(scope, buffer, 0, len).unwrap().into()
+    Some(v8::Uint8Array::new(scope, buffer, 0, len).unwrap().into())
 }
 
 #[cfg(celld_internal_tests)]
@@ -2223,6 +2249,9 @@ pub struct WorkerIsolate {
     /// turns run on whatever tokio worker holds the isolate. See
     /// `storage::Cells`.
     cells: storage::Cells,
+    /// This isolate's place under the process memory guard; dropping it
+    /// takes the isolate out.
+    _memory_guard: Option<crate::memory_guard::Registration>,
 }
 
 /// An isolate's context and the entry `fetch` that lives in it.
@@ -2826,6 +2855,13 @@ fn take_execution_termination_in_context(
         scope.cancel_terminate_execution();
     }
     if let Some(termination) = termination {
+        if termination.error.starts_with(crate::memory_guard::LIMIT_ERROR) {
+            // The terminated execution's buffers are garbage now. Collect
+            // them here, not at some later allocation: an idle Worker would
+            // otherwise keep the process over the guard's line with nothing
+            // left to blame, until the guard restarted the node for it.
+            scope.low_memory_notification();
+        }
         if termination.actor_scope.is_some() {
             if let Some(context_id) = termination.context_id {
                 if let Some(context) = state
@@ -2871,6 +2907,66 @@ extern "C" fn near_heap_limit(
     current_heap_limit
         .saturating_add(V8_HEAP_EMERGENCY_BYTES)
         .max(state.limit.saturating_mul(2))
+}
+
+/// The memory guard's interrupt (see `memory_guard`). V8 runs it on this
+/// isolate's thread, inside running JavaScript, or at the isolate's next
+/// entry when it is idle.
+///
+/// Garbage is collected before anything is decided, and freed memory is
+/// given time to leave: a request terminated a moment ago leaves its
+/// buffers behind, and they must not fail the request that runs next. Only a process still over the
+/// line after that is terminated, with the error a request then sees, the
+/// way the CPU watchdog terminates.
+unsafe extern "C" fn memory_guard_interrupt(raw: v8::UnsafeRawIsolatePtr, data: *mut std::ffi::c_void) {
+    // SAFETY: `data` is the reference the guard passed with this interrupt.
+    let Some(_check) = (unsafe { crate::memory_guard::interrupt_taken(data) }) else {
+        return;
+    };
+    if crate::memory_guard::over_line().is_none() {
+        return;
+    }
+    // SAFETY: V8 runs an interrupt on the isolate's own thread, inside it;
+    // `Isolate` is a non-owning handle.
+    let mut isolate = unsafe { v8::Isolate::from_raw_isolate_ptr(raw) };
+    if isolate.is_execution_terminating() {
+        return;
+    }
+    let Some(state) = isolate.get_slot::<Arc<ActorRuntimeState>>().cloned() else {
+        return;
+    };
+    // A termination already on its way (this guard's, or the CPU watchdog's)
+    // will unwind this execution; collecting first would only delay it.
+    if state.termination.lock().expect("termination lock poisoned").is_some() {
+        return;
+    }
+    isolate.low_memory_notification();
+    let Some((held, line)) = crate::memory_guard::still_over_after_collection() else {
+        return;
+    };
+    let mut termination = state.termination.lock().expect("termination lock poisoned");
+    if termination.is_some() {
+        return;
+    }
+    *termination = Some(ExecutionTermination {
+        error: format!(
+            "{}: the node holds {} MiB, the limit is {} MiB",
+            crate::memory_guard::LIMIT_ERROR,
+            held >> 20,
+            line >> 20
+        ),
+        actor_scope: None,
+        context_id: None,
+    });
+    drop(termination);
+    crate::memory_guard::record_termination();
+    tracing::warn!(
+        held_bytes = held,
+        line_bytes = line,
+        script = %state.script_name,
+        "memory guard: terminating JavaScript, the process is over CELLD_MEMORY_LIMIT_MB"
+    );
+    isolate.terminate_execution();
 }
 
 /// Live heap use, as a share of `limit`.
@@ -5810,8 +5906,16 @@ impl Worker {
         let do_classes = config.do_classes.as_slice();
         let node = config.node.as_str();
         let compat = config.compat;
-        let params = v8::CreateParams::default().heap_limits(0, v8_heap_limit_bytes());
+        // The heap limit does not count ArrayBuffer backing stores; the
+        // budgeted allocator does (see `array_buffer_budget`).
+        let params = v8::CreateParams::default()
+            .heap_limits(0, v8_heap_limit_bytes())
+            .array_buffer_allocator(crate::array_buffer_budget::allocator().make_shared());
         let mut isolate = v8::Isolate::new(params);
+        // Under the process memory guard from creation, so a module that
+        // allocates at evaluation is covered too (see `memory_guard`).
+        let memory_guard =
+            crate::memory_guard::register(isolate.thread_safe_handle(), memory_guard_interrupt);
         // Dynamic `import()` of builtin specifiers; per-import()-call only.
         isolate.set_host_import_module_dynamically_callback(host_import_module_dynamically);
         let original_heap_limit = isolate.get_heap_statistics().heap_size_limit();
@@ -6096,7 +6200,8 @@ impl Worker {
                 //   state is a raw pointer into the `HeapLimitState` above;
                 // - `host_import_module_dynamically`, a bare fn pointer that
                 //   captures nothing;
-                // - a default `CreateParams` allocator, owned by V8.
+                // - an `array_buffer_budget` allocator, owned by V8, whose only
+                //   handle is the process's `'static` budget (atomics only).
                 //
                 // Nothing else is attached, and the assertion fails the build
                 // if a slot type ever stops being thread-safe.
@@ -6114,6 +6219,7 @@ impl Worker {
                 compat,
                 loader_owner,
                 cells: storage::Cells::default(),
+                _memory_guard: memory_guard,
             }),
         })
     }
@@ -9941,14 +10047,19 @@ fn webcrypto_return_bytes(
     mut rv: v8::ReturnValue<v8::Value>,
     bytes: &[u8],
 ) {
-    let buffer = v8::ArrayBuffer::new(scope, bytes.len());
-    if !bytes.is_empty() {
-        let store = buffer.get_backing_store();
-        let destination = unsafe {
-            std::slice::from_raw_parts_mut(store.data().unwrap().as_ptr() as *mut u8, bytes.len())
-        };
-        destination.copy_from_slice(bytes);
-    }
+    // Not `v8::ArrayBuffer::new`: V8 aborts the process when the budgeted
+    // allocator refuses an allocation made from Rust. A refusal here throws
+    // the RangeError a refused JS allocation would.
+    let Some(store) = crate::array_buffer_budget::backing_store_from_vec(
+        bytes.to_vec(),
+        crate::array_buffer_budget::Admission::Refusable,
+    ) else {
+        let message = v8::String::new(scope, crate::array_buffer_budget::REFUSAL_MESSAGE).unwrap();
+        let exception = v8::Exception::range_error(scope, message);
+        scope.throw_exception(exception);
+        return;
+    };
+    let buffer = v8::ArrayBuffer::with_backing_store(scope, &store.make_shared());
     let view = v8::Uint8Array::new(scope, buffer, 0, bytes.len()).unwrap();
     rv.set(view.into());
 }
@@ -11905,7 +12016,12 @@ fn op_vfs_read_file(
     };
     // One copy into the V8 heap. The projected `Bytes` stays shared, so a
     // second read of the same module does not re-copy the config's source.
-    let store = v8::ArrayBuffer::new_backing_store_from_vec(bytes.to_vec()).make_shared();
+    let store = crate::array_buffer_budget::backing_store_from_vec(
+        bytes.to_vec(),
+        crate::array_buffer_budget::Admission::Charged,
+    )
+    .expect("a charged backing store is never refused")
+    .make_shared();
     let buffer = v8::ArrayBuffer::with_backing_store(scope, &store);
     rv.set(buffer.into());
 }

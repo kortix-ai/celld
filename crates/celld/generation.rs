@@ -559,6 +559,7 @@ impl Generation {
                 crons,
                 containers,
                 fence_image: fence,
+                resource_limits,
                 ..
             } = deployment;
             all_containers.extend(containers.iter().cloned());
@@ -575,6 +576,7 @@ impl Generation {
                     .with_queue_consumers(queue_catalog.clone())
                     .with_crons(if is_primary { crons } else { Vec::new() })
                     .with_containers(containers)
+                    .with_resource_limits(resource_limits)
                     .with_generation(id),
             );
             let pool = crate::runtime::StatelessRuntime::start(

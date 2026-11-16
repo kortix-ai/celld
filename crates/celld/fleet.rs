@@ -899,6 +899,7 @@ async fn load_worker_at_pointer(
     let services = service_bindings(&manifest);
     let vars = worker_vars(&manifest);
     let compat = crate::worker_compat(&manifest.raw_metadata);
+    let resource_limits = crate::deployment_resource_limits(&manifest.raw_metadata);
     let assets = match &manifest.assets {
         Some(reference) => Some(
             crate::assets::AssetResolver::load(
@@ -957,6 +958,7 @@ async fn load_worker_at_pointer(
         crons,
         containers,
         fence_image,
+        resource_limits,
     })
 }
 
@@ -979,6 +981,8 @@ pub struct LoadedDeployment {
     pub containers: Vec<crate::container::ContainerSpec>,
     /// See `Manifest::fence_image`.
     pub fence_image: Option<String>,
+    /// The config's `limits` (see `crate::deployment_resource_limits`).
+    pub resource_limits: Option<crate::WorkerInvocationLimits>,
 }
 
 fn bindings<'a>(

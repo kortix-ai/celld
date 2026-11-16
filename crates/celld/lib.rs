@@ -226,6 +226,21 @@ pub struct WorkerInvocationLimits {
     pub sub_requests: Option<u32>,
 }
 
+/// The limits a deployment's config declares (`limits.cpu_ms`). `celld deploy`
+/// validated the value; a manifest written some other way is read with the
+/// same bound, and a value outside it is ignored rather than trusted.
+pub fn deployment_resource_limits(metadata: &serde_json::Value) -> Option<WorkerInvocationLimits> {
+    let cpu_ms = metadata
+        .get("limits")?
+        .get("cpu_ms")?
+        .as_u64()
+        .filter(|ms| (1..=deploy::MAX_CPU_MS).contains(ms))?;
+    Some(WorkerInvocationLimits {
+        cpu_ms: u32::try_from(cpu_ms).ok(),
+        sub_requests: None,
+    })
+}
+
 /// One operation on a Worker entrypoint. A property read has no arguments,
 /// while a call owns its complete receiver path and structured-clone payload.
 pub enum WorkerRpcOperation {

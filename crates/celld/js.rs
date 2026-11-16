@@ -1883,6 +1883,115 @@ fn effective_resource_limits(
     (limits.cpu_ms.is_some() || limits.sub_requests.is_some()).then_some(limits)
 }
 
+/// The CPU limit of an invocation whose Worker declares none:
+/// `CELLD_CPU_LIMIT_MS`, default 30 000 ms, Cloudflare's default for a Worker
+/// or Durable Object request. `0` turns it off.
+///
+/// Before this a deployed Worker had no CPU limit at all. JavaScript runs on
+/// the host runtime's worker threads, so a request stuck in a loop held its
+/// thread for good, long after its client had gone. As many such requests as
+/// the node has threads stopped every request, Durable Object and operator
+/// call on the node, while its leases kept renewing, so no peer took its cells
+/// over and nothing restarted it.
+pub const DEFAULT_CPU_LIMIT_MS: u32 = 30_000;
+
+fn default_cpu_limit_ms() -> Option<u32> {
+    static LIMIT: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+    *LIMIT.get_or_init(|| parse_cpu_limit_ms(std::env::var("CELLD_CPU_LIMIT_MS").ok().as_deref()))
+}
+
+fn parse_cpu_limit_ms(raw: Option<&str>) -> Option<u32> {
+    match raw.map(str::trim) {
+        None | Some("") => Some(DEFAULT_CPU_LIMIT_MS),
+        Some("0") => None,
+        Some(raw) => match raw.parse::<u32>() {
+            Ok(ms) => Some(ms),
+            Err(_) => {
+                tracing::warn!(value = raw, default_ms = DEFAULT_CPU_LIMIT_MS, "CELLD_CPU_LIMIT_MS is not a number of milliseconds; using the default");
+                Some(DEFAULT_CPU_LIMIT_MS)
+            }
+        },
+    }
+}
+
+/// `limits` with the node's default CPU limit filled in where none was
+/// declared. A declared limit, larger or smaller, is kept as it is.
+fn with_default_cpu_limit(limits: Option<ResourceLimits>) -> Option<ResourceLimits> {
+    apply_default_cpu_limit(limits, default_cpu_limit_ms())
+}
+
+fn apply_default_cpu_limit(limits: Option<ResourceLimits>, default: Option<u32>) -> Option<ResourceLimits> {
+    let Some(default) = default else {
+        return limits;
+    };
+    let mut limits = limits.unwrap_or_default();
+    limits.cpu_ms.get_or_insert(default);
+    Some(limits)
+}
+
+#[cfg(test)]
+mod default_cpu_limit_tests {
+    use super::*;
+
+    #[test]
+    fn a_worker_that_declares_nothing_gets_the_default() {
+        let limits = apply_default_cpu_limit(None, Some(DEFAULT_CPU_LIMIT_MS)).unwrap();
+        assert_eq!(limits.cpu_ms, Some(DEFAULT_CPU_LIMIT_MS));
+        assert_eq!(limits.sub_requests, None);
+    }
+
+    #[test]
+    fn a_declared_limit_is_kept_larger_or_smaller() {
+        for declared in [50, 300_000] {
+            let declared = ResourceLimits { cpu_ms: Some(declared), sub_requests: Some(7) };
+            assert_eq!(apply_default_cpu_limit(Some(declared), Some(DEFAULT_CPU_LIMIT_MS)), Some(declared));
+        }
+    }
+
+    #[test]
+    fn subrequests_alone_still_get_a_cpu_limit() {
+        let declared = ResourceLimits { cpu_ms: None, sub_requests: Some(7) };
+        let limits = apply_default_cpu_limit(Some(declared), Some(1_000)).unwrap();
+        assert_eq!((limits.cpu_ms, limits.sub_requests), (Some(1_000), Some(7)));
+    }
+
+    #[test]
+    fn zero_turns_the_default_off() {
+        assert_eq!(parse_cpu_limit_ms(Some("0")), None);
+        assert_eq!(apply_default_cpu_limit(None, None), None);
+    }
+
+    #[test]
+    fn the_environment_value_is_read() {
+        assert_eq!(parse_cpu_limit_ms(None), Some(DEFAULT_CPU_LIMIT_MS));
+        assert_eq!(parse_cpu_limit_ms(Some("")), Some(DEFAULT_CPU_LIMIT_MS));
+        assert_eq!(parse_cpu_limit_ms(Some("1500")), Some(1_500));
+        assert_eq!(parse_cpu_limit_ms(Some("lots")), Some(DEFAULT_CPU_LIMIT_MS));
+    }
+
+    #[test]
+    fn deploy_accepts_cpu_ms_only() {
+        use crate::deploy::read_limits;
+        use serde_json::json;
+        assert_eq!(read_limits(&json!({ "cpu_ms": 60000 })).unwrap(), json!({ "cpu_ms": 60000 }));
+        assert_eq!(read_limits(&json!({})).unwrap(), json!({}));
+        assert!(read_limits(&json!({ "cpu_ms": 0 })).is_err());
+        assert!(read_limits(&json!({ "cpu_ms": 300001 })).is_err());
+        assert!(read_limits(&json!({ "cpu_ms": 1.5 })).is_err());
+        assert!(read_limits(&json!({ "subrequests": 5 })).is_err());
+        assert!(read_limits(&json!(5)).is_err());
+    }
+
+    #[test]
+    fn deployment_limits_are_read_within_the_bound() {
+        let read = |value: serde_json::Value| crate::deployment_resource_limits(&value).and_then(|l| l.cpu_ms);
+        assert_eq!(read(serde_json::json!({ "limits": { "cpu_ms": 120000 } })), Some(120_000));
+        assert_eq!(read(serde_json::json!({ "limits": { "cpu_ms": 300001 } })), None);
+        assert_eq!(read(serde_json::json!({ "limits": { "cpu_ms": 0 } })), None);
+        assert_eq!(read(serde_json::json!({})), None);
+    }
+}
+
 struct CpuTurnStart {
     thread_nanos: Option<u64>,
     wall: Instant,
@@ -2173,8 +2282,9 @@ impl WorkerConfig {
         self
     }
 
-    /// Install the limits that every invocation of this Dynamic Worker owns.
-    fn with_resource_limits(mut self, limits: Option<ResourceLimits>) -> Self {
+    /// Install the limits that every invocation of this Worker owns: a Dynamic
+    /// Worker's `WorkerCode.limits`, or a deployment's config `limits`.
+    pub(crate) fn with_resource_limits(mut self, limits: Option<ResourceLimits>) -> Self {
         self.resource_limits = limits;
         self
     }
@@ -2772,6 +2882,13 @@ fn run_cpu_watchdog_service(shared: &Arc<(Mutex<CpuWatchdogState>, std::sync::Co
                 });
                 drop(termination);
                 watch.isolate.terminate_execution();
+                // The client sees a 500; the Worker's owner reads why here.
+                tracing::warn!(
+                    event = "cpu_limit_exceeded",
+                    script = %watch.runtime_state.script_name,
+                    limit_ms = watch.declared_ms,
+                    "a Worker invocation used its whole CPU limit and was stopped"
+                );
             }
         }
     }
@@ -5923,7 +6040,7 @@ impl Worker {
         let runtime_state = Arc::new(ActorRuntimeState {
             promises: std::sync::Mutex::new(PromiseMap::new()),
             egress: config.egress.clone(),
-            resource_limits: config.resource_limits,
+            resource_limits: with_default_cpu_limit(config.resource_limits),
             tail_reporting: config.tail_reporting,
             script_name: script_name.to_string(),
             ..Default::default()

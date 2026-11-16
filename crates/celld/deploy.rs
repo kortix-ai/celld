@@ -61,7 +61,31 @@ const SUPPORTED_KEYS: &[&str] = &[
     "no_bundle",
     "define",
     "rules",
+    "limits",
 ];
+
+/// The longest `limits.cpu_ms` a config may set: Cloudflare's own maximum
+/// (five minutes), so a config valid there is valid here and no request holds
+/// a node's thread for longer.
+pub const MAX_CPU_MS: u64 = 300_000;
+
+/// Validate the config's `limits`. Only `cpu_ms` is understood; any other key
+/// is refused for the same reason unknown top-level keys are.
+pub(crate) fn read_limits(limits: &Value) -> anyhow::Result<Value> {
+    let Some(object) = limits.as_object() else {
+        bail!("`limits` must be an object, like {{ \"cpu_ms\": 30000 }}");
+    };
+    if let Some(other) = object.keys().find(|key| key.as_str() != "cpu_ms") {
+        bail!("`limits.{other}` is not supported; celld understands `limits.cpu_ms` only");
+    }
+    let Some(cpu_ms) = object.get("cpu_ms") else {
+        return Ok(json!({}));
+    };
+    match cpu_ms.as_u64() {
+        Some(ms @ 1..=MAX_CPU_MS) => Ok(json!({ "cpu_ms": ms })),
+        _ => bail!("`limits.cpu_ms` must be a whole number of milliseconds from 1 to {MAX_CPU_MS}"),
+    }
+}
 
 /// The Durable Object class every D1 database runs as. It is supplied by the
 /// runtime, not by the worker, so a config naming it in `durable_objects` or
@@ -1979,6 +2003,9 @@ fn read_project(path: &Path, root: &Path, overrides: &VarOverrides) -> anyhow::R
     }
     if let Some(flags) = object.get("compatibility_flags") {
         metadata.insert("compatibility_flags".into(), flags.clone());
+    }
+    if let Some(limits) = object.get("limits") {
+        metadata.insert("limits".into(), read_limits(limits)?);
     }
     metadata.insert("bindings".into(), Value::Array(bindings));
     if !queue_consumers.is_empty() {

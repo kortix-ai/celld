@@ -186,6 +186,68 @@ pub(crate) struct PreservedCache {
     /// `None` until the first adoption or while a failed mutation requires a
     /// rescan.
     since_resync: Option<u32>,
+    /// Empty epoch directories the last adoption walk found, with their
+    /// modification time, for `sweep_empty_epoch_dirs`.
+    empty_epoch_dirs: Vec<(PathBuf, i64)>,
+}
+
+/// The most preserved snapshots a node keeps, whatever their bytes.
+///
+/// The byte ceiling alone does not bound the files: a Durable Object that
+/// stores one key leaves a 48 KiB snapshot, so the 2 GiB default held about
+/// 44,000 of them, four inodes each with their directories. A 10 GiB cell has
+/// 655,360 inodes. This keeps the cache to 16,384 snapshots (about 65,000
+/// inodes); a cell whose snapshot was dropped restores from the bucket.
+pub(crate) const MAX_PRESERVED_SNAPSHOTS: usize = 16_384;
+
+/// An empty epoch directory the walk finds is removed only once it is this
+/// old. An activation creates its directory before it restores into it, and
+/// a remote restore can take a while; nothing takes an hour.
+const EMPTY_EPOCH_DIR_AGE_MS: i64 = 60 * 60 * 1000;
+
+/// Remove `directory`, then each parent while it is empty, stopping below
+/// `watch`. A cell's files live in `<watch>/<cell>/ltx/e<epoch>/`, and nothing
+/// removed those directories once their last file went: every Durable Object
+/// a node ever held left three directories behind, and every reactivation one
+/// more epoch directory, until the filesystem ran out of inodes and the node
+/// could not write at all.
+///
+/// Only empty directories go (`rmdir`), so the first level that still holds
+/// anything stops the walk: a directory an activation is filling already holds
+/// its epoch directory or file. An activation that creates its directory while
+/// this runs loses nothing either, because `create_dir_all` recreates a parent
+/// that vanished under it. Returns how many directories went.
+pub(crate) fn remove_empty_ancestors(
+    filesystem: &dyn celld_ltx::FileSystem,
+    watch: &std::path::Path,
+    directory: &std::path::Path,
+) -> usize {
+    let mut removed = 0;
+    let mut current = Some(directory);
+    while let Some(dir) = current {
+        if dir == watch || !dir.starts_with(watch) {
+            break;
+        }
+        if filesystem.remove_empty_dir(dir).is_err() {
+            break;
+        }
+        removed += 1;
+        current = dir.parent();
+    }
+    removed
+}
+
+/// Is `path` a cell's epoch directory, `<watch>/<cell>/ltx/e<digits>`?
+pub(crate) fn is_epoch_dir(watch: &std::path::Path, path: &std::path::Path) -> bool {
+    let Ok(rest) = path.strip_prefix(watch) else {
+        return false;
+    };
+    let parts: Vec<_> = rest.components().collect();
+    parts.len() == 3
+        && parts[1].as_os_str() == "ltx"
+        && parts[2].as_os_str().to_str().is_some_and(|name| {
+            name.len() > 1 && name.starts_with('e') && name[1..].bytes().all(|b| b.is_ascii_digit())
+        })
 }
 
 /// Rebuild after this many prunes. The index is maintained at every point that
@@ -203,6 +265,7 @@ impl PreservedCache {
             entries: std::collections::BTreeMap::new(),
             bytes: 0,
             since_resync: None,
+            empty_epoch_dirs: Vec::new(),
         }
     }
 
@@ -274,13 +337,41 @@ impl PreservedCache {
             }
             Some(count) => self.since_resync = Some(count + 1),
         }
-        if self.bytes <= max_bytes {
+        if self.bytes <= max_bytes && self.entries.len() <= MAX_PRESERVED_SNAPSHOTS {
             return match first_error {
                 Some(error) => Err(error),
                 None => Ok((self.entries.len(), 0, self.bytes)),
             };
         }
         let mut evicted = 0;
+        // The count bound first: the oldest snapshots past it go, whatever
+        // their size. A failed removal stays counted and is not retried here.
+        if self.entries.len() > MAX_PRESERVED_SNAPSHOTS {
+            let mut by_age: Vec<_> = self
+                .entries
+                .iter()
+                .map(|(path, entry)| (entry.last_used_ms, path.clone()))
+                .collect();
+            by_age.sort();
+            let excess = self.entries.len() - MAX_PRESERVED_SNAPSHOTS;
+            for (_, path) in by_age.into_iter().take(excess) {
+                match self.filesystem.remove_file(&path) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => {
+                        if first_error.is_none() {
+                            first_error = Some(error);
+                        }
+                        continue;
+                    }
+                }
+                self.forget(&path);
+                evicted += 1;
+                if let Some(parent) = path.parent() {
+                    remove_empty_ancestors(&*self.filesystem, watch, parent);
+                }
+            }
+        }
         let mut failed_paths = std::collections::BTreeSet::new();
         loop {
             // A failed deletion remains part of the byte total and is pinned
@@ -308,6 +399,9 @@ impl PreservedCache {
                     Ok(()) => {
                         self.forget(&paths[index]);
                         evicted += 1;
+                        if let Some(parent) = paths[index].parent() {
+                            remove_empty_ancestors(&*self.filesystem, watch, parent);
+                        }
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                         self.forget(&paths[index]);
@@ -379,11 +473,17 @@ impl PreservedCache {
     fn adopt(&mut self, watch: &std::path::Path) -> std::io::Result<()> {
         let mut entries = std::collections::BTreeMap::new();
         let mut bytes = 0_u64;
+        let mut empty_epoch_dirs = Vec::new();
         let mut stack = vec![watch.to_path_buf()];
         while let Some(directory) = stack.pop() {
             let Some(read) = self.read_adoption_directory(watch, &directory)? else {
                 continue;
             };
+            if read.is_empty() && is_epoch_dir(watch, &directory) {
+                if let Ok(meta) = self.filesystem.metadata(&directory) {
+                    empty_epoch_dirs.push((directory.clone(), meta.modified_unix_millis));
+                }
+            }
             for item in read {
                 let path = item.path;
                 if item.is_dir {
@@ -414,8 +514,28 @@ impl PreservedCache {
         }
         self.entries = entries;
         self.bytes = bytes;
+        self.empty_epoch_dirs = empty_epoch_dirs;
         self.since_resync = Some(0);
         Ok(())
+    }
+
+    /// Remove the empty epoch directories the last walk found that are older
+    /// than `EMPTY_EPOCH_DIR_AGE_MS`, with every parent they leave empty.
+    /// Directories that a node before this fix left behind go here; the
+    /// prune, the eviction and the activation keep new ones from piling up.
+    /// Returns how many directories went.
+    pub(crate) fn sweep_empty_epoch_dirs(
+        &mut self,
+        watch: &std::path::Path,
+        now_unix_millis: i64,
+    ) -> usize {
+        let mut removed = 0;
+        for (directory, modified) in std::mem::take(&mut self.empty_epoch_dirs) {
+            if now_unix_millis.saturating_sub(modified) >= EMPTY_EPOCH_DIR_AGE_MS {
+                removed += remove_empty_ancestors(&*self.filesystem, watch, &directory);
+            }
+        }
+        removed
     }
 }
 
@@ -469,4 +589,143 @@ pub fn sqlite_snapshot_on_vfs_for_test(
     vfs: &str,
 ) -> anyhow::Result<()> {
     sqlite_snapshot(source, destination, Some(vfs))
+}
+
+#[cfg(test)]
+mod directory_tests {
+    // Real directories through the direct filesystem: what a node's watch root
+    // holds after evictions, prunes and reactivations.
+    #![allow(clippy::disallowed_methods)]
+    use super::*;
+    use std::path::Path;
+
+    fn fs() -> Arc<dyn celld_ltx::FileSystem> {
+        Arc::new(celld_ltx::DirectFileSystem)
+    }
+
+    fn snapshot(watch: &Path, cell: &str, epoch: u64, bytes: usize) -> PathBuf {
+        let dir = watch.join(cell).join("ltx").join(format!("e{epoch}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("db.evicted");
+        std::fs::write(&path, vec![0_u8; bytes]).unwrap();
+        path
+    }
+
+    fn count_dirs(root: &Path) -> usize {
+        let mut n = 0;
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap() {
+                let entry = entry.unwrap();
+                if entry.file_type().unwrap().is_dir() {
+                    n += 1;
+                    stack.push(entry.path());
+                }
+            }
+        }
+        n
+    }
+
+    #[test]
+    fn empty_ancestors_go_up_to_the_watch_root_and_stop_at_anything_left() {
+        let tmp = tempfile::tempdir().unwrap();
+        let watch = tmp.path().join("w");
+        let lone = snapshot(&watch, "Obj:a", 1, 10);
+        std::fs::remove_file(&lone).unwrap();
+        assert_eq!(remove_empty_ancestors(&*fs(), &watch, lone.parent().unwrap()), 3);
+        assert!(watch.is_dir(), "the watch root itself stays");
+        assert!(!watch.join("Obj:a").exists());
+
+        // A cell with a newer epoch keeps `ltx` and itself.
+        let old = snapshot(&watch, "Obj:b", 1, 10);
+        let new = snapshot(&watch, "Obj:b", 2, 10);
+        std::fs::remove_file(&old).unwrap();
+        assert_eq!(remove_empty_ancestors(&*fs(), &watch, old.parent().unwrap()), 1);
+        assert!(new.is_file());
+        // A directory that still holds a file is never removed.
+        assert_eq!(remove_empty_ancestors(&*fs(), &watch, new.parent().unwrap()), 0);
+        assert!(new.is_file());
+        // Nothing outside the watch root, even if empty.
+        let outside = tmp.path().join("elsewhere/e1");
+        std::fs::create_dir_all(&outside).unwrap();
+        assert_eq!(remove_empty_ancestors(&*fs(), &watch, &outside), 0);
+        assert!(outside.is_dir());
+    }
+
+    #[test]
+    fn only_cell_epoch_directories_are_epoch_dirs() {
+        let w = Path::new("/w");
+        assert!(is_epoch_dir(w, Path::new("/w/Obj:a/ltx/e1")));
+        assert!(is_epoch_dir(w, Path::new("/w/Obj:a/ltx/e123")));
+        for not in ["/w/Obj:a/ltx", "/w/Obj:a/ltx/e", "/w/Obj:a/ltx/e1x", "/w/Obj:a/other/e1", "/w/Obj:a/ltx/e1/meta", "/x/Obj:a/ltx/e1", "/w/e1"] {
+            assert!(!is_epoch_dir(w, Path::new(not)), "{not}");
+        }
+    }
+
+    #[test]
+    fn a_pruned_snapshot_takes_its_directories_with_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let watch = tmp.path().join("w");
+        let mut cache = PreservedCache::new(fs());
+        for i in 0..20 {
+            cache.insert(snapshot(&watch, &format!("Obj:{i:02}"), 1, 1000)).unwrap();
+        }
+        assert_eq!(count_dirs(&watch), 60);
+        // 20 KB of snapshots under a 5 KB ceiling: 15 go, and their 45 directories.
+        let (kept, evicted, _) = cache.prune(&watch, 5_000).unwrap();
+        assert_eq!((kept, evicted), (5, 15));
+        assert_eq!(count_dirs(&watch), 15);
+    }
+
+    #[test]
+    fn the_snapshot_count_is_bounded_whatever_the_bytes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let watch = tmp.path().join("w");
+        let mut cache = PreservedCache::new(fs());
+        cache.prune(&watch, u64::MAX).unwrap_err(); // no watch root yet: the first walk says so
+        std::fs::create_dir_all(&watch).unwrap();
+        cache.prune(&watch, u64::MAX).unwrap();
+        let extra = 3;
+        for i in 0..MAX_PRESERVED_SNAPSHOTS + extra {
+            let path = watch.join(format!("Obj:{i:05}/ltx/e1/db.evicted"));
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, b"x").unwrap();
+            cache.insert(path).unwrap();
+        }
+        let (kept, evicted, _) = cache.prune(&watch, u64::MAX).unwrap();
+        assert_eq!((kept, evicted), (MAX_PRESERVED_SNAPSHOTS, extra));
+        assert_eq!(count_dirs(&watch), 3 * MAX_PRESERVED_SNAPSHOTS);
+    }
+
+    #[test]
+    fn the_walk_sweeps_old_empty_epoch_dirs_and_spares_new_ones() {
+        let tmp = tempfile::tempdir().unwrap();
+        let watch = tmp.path().join("w");
+        // What a node before the fix left: pruned cells, a cell's old epochs,
+        // and one activation that has just created its directory.
+        for i in 0..5 {
+            std::fs::create_dir_all(watch.join(format!("Obj:gone{i}/ltx/e1"))).unwrap();
+        }
+        for e in 1..4 {
+            std::fs::create_dir_all(watch.join(format!("Obj:hot/ltx/e{e}"))).unwrap();
+        }
+        let live = snapshot(&watch, "Obj:hot", 4, 10);
+        std::fs::create_dir_all(watch.join("node-log")).unwrap(); // not a cell: never touched
+        let mut cache = PreservedCache::new(fs());
+        cache.prune(&watch, u64::MAX).unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        // Just made: an activation may be about to restore into it.
+        assert_eq!(cache.sweep_empty_epoch_dirs(&watch, now), 0);
+        assert_eq!(count_dirs(&watch), 5 * 3 + 2 + 4 + 1); // gone cells; hot cell, ltx, e1-e4; node-log
+        // An hour on, the next walk removes them.
+        cache.since_resync = None;
+        cache.prune(&watch, u64::MAX).unwrap();
+        assert_eq!(cache.sweep_empty_epoch_dirs(&watch, now + EMPTY_EPOCH_DIR_AGE_MS), 5 * 3 + 3);
+        assert!(live.is_file());
+        assert!(watch.join("node-log").is_dir());
+        assert_eq!(count_dirs(&watch), 3 + 1);
+    }
 }

@@ -2326,6 +2326,7 @@ impl LtxRepl {
         }
         let dst = self.db_path(cell, epoch);
         self.ltx_host.create_dir_all(dst.parent().unwrap())?;
+        self.remove_empty_older_epochs(cell, epoch);
 
         // The takeover interlock moved OUT of this path (lease-fold): the
         // decision core gates foreign takeovers on the folded lease state
@@ -2388,6 +2389,10 @@ impl LtxRepl {
                 .lock()
                 .expect("preserved cache poisoned")
                 .forget(&snapshot);
+            // The previous epoch's directory held only that snapshot.
+            if let Some(parent) = snapshot.parent() {
+                let _ = self.ltx_host.remove_empty_dir(parent);
+            }
             info!(cell, epoch, "reused local eviction snapshot");
             restored = true;
         } else if !fresh {
@@ -3726,6 +3731,37 @@ impl LtxRepl {
         if !preserve_local {
             let _ = self.ltx_host.remove_file(&db);
         }
+        // A preserved snapshot keeps its directory; otherwise the epoch
+        // directory is empty now, and so may be the cell's.
+        if let Some(parent) = db.parent() {
+            crate::replication::remove_empty_ancestors(
+                &*self.ltx_host.filesystem(),
+                &self.watch,
+                parent,
+            );
+        }
+    }
+
+    /// Remove this cell's empty epoch directories below `epoch`. Each
+    /// activation works in a new `e<epoch>` directory, and the one before it
+    /// stayed behind, empty, once its snapshot was reused or pruned: one
+    /// directory per wake, forever.
+    fn remove_empty_older_epochs(&self, cell: &str, epoch: u64) {
+        let Ok(entries) = self.ltx_host.read_dir(&self.watch.join(cell).join("ltx")) else {
+            return;
+        };
+        for entry in entries {
+            let older = entry.is_dir
+                && entry
+                    .file_name
+                    .to_str()
+                    .and_then(|name| name.strip_prefix('e'))
+                    .and_then(|digits| digits.parse::<u64>().ok())
+                    .is_some_and(|other| other < epoch);
+            if older {
+                let _ = self.ltx_host.remove_empty_dir(&entry.path);
+            }
+        }
     }
 
     /// Capture one full snapshot after the runtime closes.
@@ -3952,10 +3988,13 @@ impl LtxRepl {
     }
 
     pub fn prune_local_cache(&self, max_bytes: u64) -> std::io::Result<(usize, usize, u64)> {
-        self.preserved
-            .lock()
-            .expect("preserved cache poisoned")
-            .prune(&self.watch, max_bytes)
+        let mut preserved = self.preserved.lock().expect("preserved cache poisoned");
+        let pruned = preserved.prune(&self.watch, max_bytes);
+        let swept = preserved.sweep_empty_epoch_dirs(&self.watch, self.ltx_host.now_unix_millis());
+        if swept > 0 {
+            info!(directories = swept, "removed empty cell directories left by earlier evictions");
+        }
+        pruned
     }
 
     /// Prove the stopped database position durable, then close the replicator

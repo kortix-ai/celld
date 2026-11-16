@@ -95,6 +95,15 @@ pub trait FileSystem: Send + Sync {
     fn remove_file(&self, path: &Path) -> io::Result<()>;
     fn remove_dir_all(&self, path: &Path) -> io::Result<()>;
     fn create_dir_all(&self, path: &Path) -> io::Result<()>;
+    /// Removes `path` only when it is an empty directory, like `rmdir(2)`.
+    /// The default refuses, so a custom filesystem never loses a directory it
+    /// was not written for; celld then keeps the empty directory, as before.
+    fn remove_empty_dir(&self, _path: &Path) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "the filesystem does not remove single directories",
+        ))
+    }
 }
 
 /// The telemetry-only microsecond clock for the capture ledger
@@ -221,6 +230,10 @@ impl FileSystem for DirectFileSystem {
     fn create_dir_all(&self, path: &Path) -> io::Result<()> {
         std::fs::create_dir_all(path)
     }
+
+    fn remove_empty_dir(&self, path: &Path) -> io::Result<()> {
+        std::fs::remove_dir(path)
+    }
 }
 
 /// A failure to dispatch or join one host blocking job.
@@ -338,6 +351,10 @@ impl LtxHost {
 
     pub fn create_dir_all(&self, path: &Path) -> io::Result<()> {
         self.inner.filesystem.create_dir_all(path)
+    }
+
+    pub fn remove_empty_dir(&self, path: &Path) -> io::Result<()> {
+        self.inner.filesystem.remove_empty_dir(path)
     }
 
     /// Returns the current wall time as Unix milliseconds.

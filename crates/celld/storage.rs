@@ -89,6 +89,9 @@ struct OpenCell {
     /// read-only answer reports what it observed only above it, and a reader
     /// on a cell no handler has written asks for no proof.
     published_position: Option<u64>,
+    /// The disk sample (`disk_reserve`) this connection's page cap was last
+    /// set from; 0 = never.
+    disk_cap_generation: std::cell::Cell<u64>,
 }
 
 enum StorageBacking {
@@ -878,6 +881,7 @@ fn finish_open(
                 replicated_wake,
                 backing,
                 published_position: None,
+                disk_cap_generation: std::cell::Cell::new(0),
             },
         )
     });
@@ -918,15 +922,254 @@ pub fn close(scope: &str) {
 }
 
 fn with<T>(scope: &str, f: impl FnOnce(&Connection) -> T) -> Option<T> {
-    dbs(|d| d.borrow().get(scope).map(|cell| f(&cell.connection)))
+    dbs(|d| {
+        d.borrow().get(scope).map(|cell| {
+            disk_reserve::cap(scope, cell);
+            f(&cell.connection)
+        })
+    })
 }
 
 fn with_mut<T>(scope: &str, f: impl FnOnce(&mut Connection) -> T) -> Option<T> {
     dbs(|d| {
-        d.borrow_mut()
-            .get_mut(scope)
-            .map(|cell| f(&mut cell.connection))
+        d.borrow_mut().get_mut(scope).map(|cell| {
+            disk_reserve::cap(scope, cell);
+            f(&mut cell.connection)
+        })
     })
+}
+
+/// A DISK RESERVE FOR THE NODE ITSELF.
+///
+/// A Worker that filled its node's disk took the node down for good (Platinum
+/// Dev, 2026-11-16, a 2 GiB cell with a 10 GB disk): at 9.2 GiB of Durable
+/// Object values the WAL capture failed "database or disk is full", celld
+/// aborted, and every restart failed on the same full disk, while reads,
+/// deletes and the application's own recovery could never run again.
+///
+/// SQLite's `max_page_count` makes a write that needs a new page fail with
+/// SQLITE_FULL, which celld already handles: a statement error the caller can
+/// catch, or, where SQLite rolled an explicit transaction back, a failed-closed
+/// actor. Reads, deletes and writes into pages the database already holds keep
+/// working: Cloudflare's behavior at a Durable Object's storage limit. Before
+/// a connection is used its cap is set to the pages it holds plus the disk's
+/// free space above the reserve, re-read at most every DISK_SAMPLE, so the
+/// node keeps room for its WAL, its replication segments and its log.
+///
+/// CELLD_DISK_RESERVE_MB sets the reserve (0 turns the cap off); the default
+/// is the larger of 512 MiB and 5% of the filesystem.
+mod disk_reserve {
+    use super::{without_sql_authorizer, OpenCell, StorageBacking};
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+    use std::sync::OnceLock;
+    use std::time::{Duration, Instant};
+
+    const MIB: u64 = 1024 * 1024;
+    const DISK_SAMPLE: Duration = Duration::from_millis(100);
+
+    #[derive(Clone, Copy)]
+    struct Sample {
+        at: Instant,
+        free: u64,
+        total: u64,
+        generation: u64,
+    }
+
+    thread_local! {
+        /// One sample per database directory, per isolate thread.
+        static SAMPLES: RefCell<HashMap<String, Sample>> = RefCell::new(HashMap::new());
+        static NEXT_GENERATION: std::cell::Cell<u64> = const { std::cell::Cell::new(1) };
+        /// Scopes whose cap a test pinned: never moved by the reserve.
+        static PINNED: RefCell<std::collections::HashSet<String>> = RefCell::new(Default::default());
+        static WARNED_FULL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    fn configured_mb() -> Option<u64> {
+        static MB: OnceLock<Option<u64>> = OnceLock::new();
+        *MB.get_or_init(|| {
+            std::env::var("CELLD_DISK_RESERVE_MB")
+                .ok()
+                .and_then(|v| v.trim().parse::<u64>().ok())
+        })
+    }
+
+    /// The reserve for a filesystem of `total` bytes; 0 = no cap.
+    pub(super) fn reserve_bytes(total: u64, configured_mb: Option<u64>) -> u64 {
+        match configured_mb {
+            Some(mb) => mb.saturating_mul(MIB),
+            None => (512 * MIB).max(total / 20),
+        }
+    }
+
+    /// The page cap: the pages held now plus the free space above the reserve.
+    pub(super) fn page_cap(page_count: u64, page_size: u64, free: u64, reserve: u64) -> u64 {
+        let allowance = free.saturating_sub(reserve) / page_size.max(1);
+        // SQLite's own ceiling for max_page_count.
+        page_count
+            .saturating_add(allowance)
+            .min(u32::MAX as u64 - 1)
+    }
+
+    fn statvfs(path: &str) -> Option<(u64, u64)> {
+        let c = std::ffi::CString::new(path).ok()?;
+        let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+        // SAFETY: `c` is a valid NUL-terminated path and `st` a valid out-pointer.
+        if unsafe { libc::statvfs(c.as_ptr(), &mut st) } != 0 {
+            return None;
+        }
+        let unit = st.f_frsize as u64;
+        Some((st.f_bavail as u64 * unit, st.f_blocks as u64 * unit))
+    }
+
+    fn sample(path: &str) -> Option<Sample> {
+        let dir = std::path::Path::new(path)
+            .parent()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let fresh = SAMPLES.with(|s| {
+            s.borrow()
+                .get(&dir)
+                .filter(|x| x.at.elapsed() < DISK_SAMPLE)
+                .copied()
+        });
+        if fresh.is_some() {
+            return fresh;
+        }
+        let (free, total) = statvfs(if dir.is_empty() { "." } else { &dir })?;
+        let generation = NEXT_GENERATION.with(|g| {
+            let n = g.get();
+            g.set(n.wrapping_add(1).max(1));
+            n
+        });
+        let x = Sample {
+            at: Instant::now(),
+            free,
+            total,
+            generation,
+        };
+        SAMPLES.with(|s| s.borrow_mut().insert(dir, x));
+        Some(x)
+    }
+
+    #[cfg(celld_internal_tests)]
+    pub(super) fn pin(scope: &str) {
+        PINNED.with(|p| p.borrow_mut().insert(scope.to_string()));
+    }
+
+    pub(super) fn cap(scope: &str, cell: &OpenCell) {
+        let path = match &cell.backing {
+            StorageBacking::File { path, .. } => path.as_str(),
+            StorageBacking::Embedded { root_path, .. } => root_path.as_str(),
+        };
+        let configured = configured_mb();
+        if configured == Some(0) || PINNED.with(|p| p.borrow().contains(scope)) {
+            return;
+        }
+        let Some(x) = sample(path) else { return };
+        if cell.disk_cap_generation.get() == x.generation {
+            return;
+        }
+        let reserve = reserve_bytes(x.total, configured);
+        let connection = &cell.connection;
+        let set = without_sql_authorizer(connection, || -> rusqlite::Result<u64> {
+            let page_size: u64 =
+                connection.query_row("PRAGMA page_size", [], |r| r.get::<_, i64>(0))? as u64;
+            let page_count: u64 =
+                connection.query_row("PRAGMA page_count", [], |r| r.get::<_, i64>(0))? as u64;
+            let cap = page_cap(page_count, page_size, x.free, reserve);
+            connection.pragma_update(None, "max_page_count", cap)?;
+            Ok(cap.saturating_sub(page_count))
+        });
+        match set {
+            Ok(allowance) => {
+                cell.disk_cap_generation.set(x.generation);
+                let full = allowance == 0;
+                if full != WARNED_FULL.with(|w| w.get()) {
+                    WARNED_FULL.with(|w| w.set(full));
+                    if full {
+                        tracing::warn!(
+                            free_mib = x.free / MIB,
+                            reserve_mib = reserve / MIB,
+                            "disk reserve reached: a storage write that needs more space fails with SQLITE_FULL until space is freed"
+                        );
+                    } else {
+                        tracing::info!(
+                            free_mib = x.free / MIB,
+                            reserve_mib = reserve / MIB,
+                            "disk reserve: storage writes have room again"
+                        );
+                    }
+                }
+            }
+            Err(error) => {
+                tracing::debug!(%error, scope, "disk reserve: could not set max_page_count")
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn the_default_reserve_is_512_mib_or_5_percent() {
+            assert_eq!(reserve_bytes(10 * 1024 * MIB, None), 512 * MIB);
+            assert_eq!(reserve_bytes(100 * 1024 * MIB, None), 5 * 1024 * MIB);
+            assert_eq!(reserve_bytes(100 * 1024 * MIB, Some(64)), 64 * MIB);
+            assert_eq!(reserve_bytes(100 * 1024 * MIB, Some(0)), 0);
+        }
+
+        #[test]
+        fn the_cap_is_the_pages_held_plus_free_space_above_the_reserve() {
+            assert_eq!(
+                page_cap(100, 4096, 600 * MIB, 512 * MIB),
+                100 + (88 * MIB) / 4096
+            );
+            // At or below the reserve: no new page, but every page held stays usable.
+            assert_eq!(page_cap(100, 4096, 512 * MIB, 512 * MIB), 100);
+            assert_eq!(page_cap(100, 4096, 10 * MIB, 512 * MIB), 100);
+            assert_eq!(
+                page_cap(u32::MAX as u64, 4096, u64::MAX, 0),
+                u32::MAX as u64 - 1
+            );
+        }
+
+        #[test]
+        fn a_capped_connection_refuses_growth_and_keeps_reads_deletes_and_overwrites() {
+            let c = rusqlite::Connection::open_in_memory().unwrap();
+            c.execute_batch("CREATE TABLE kv(k TEXT PRIMARY KEY, v BLOB)")
+                .unwrap();
+            for i in 0..64 {
+                c.execute(
+                    "INSERT INTO kv VALUES(?1, zeroblob(4096))",
+                    [format!("k{i}")],
+                )
+                .unwrap();
+            }
+            let held: i64 = c.query_row("PRAGMA page_count", [], |r| r.get(0)).unwrap();
+            c.pragma_update(
+                None,
+                "max_page_count",
+                page_cap(held as u64, 4096, 0, 512 * MIB),
+            )
+            .unwrap();
+            let grow = c.execute("INSERT INTO kv VALUES('big', zeroblob(1048576))", []);
+            let err = grow.expect_err("growth past the cap must fail");
+            assert!(err.to_string().contains("full"), "{err}");
+            assert_eq!(
+                c.query_row("SELECT count(*) FROM kv", [], |r| r.get::<_, i64>(0))
+                    .unwrap(),
+                64
+            );
+            c.execute("UPDATE kv SET v = zeroblob(4096) WHERE k = 'k1'", [])
+                .unwrap();
+            c.execute("DELETE FROM kv WHERE k < 'k3'", []).unwrap();
+            // Pages a delete freed are reused without growing the file.
+            c.execute("INSERT INTO kv VALUES('again', zeroblob(4096))", [])
+                .unwrap();
+        }
+    }
 }
 
 /// Return the epoch installed with the active cell database.
@@ -3323,6 +3566,7 @@ pub fn set_query_only_for_test(scope: &str, enabled: bool) -> anyhow::Result<()>
 
 #[cfg(celld_internal_tests)]
 pub fn set_max_page_count_for_test(scope: &str, pages: u32) -> anyhow::Result<()> {
+    disk_reserve::pin(scope);
     with(scope, |connection| {
         without_sql_authorizer(connection, || {
             connection

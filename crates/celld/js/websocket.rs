@@ -374,7 +374,7 @@ pub(super) fn op_ws_upgrade(
     let url = args.get(2).to_rust_string_lossy(scope);
     // The subprotocol list is read back out of these headers, so a silent
     // default opened the socket with no headers and no subprotocol at all.
-    let headers: Vec<(String, String)> =
+    let mut headers: Vec<(String, String)> =
         match serde_json::from_str(&args.get(3).to_rust_string_lossy(scope)) {
             Ok(headers) => headers,
             Err(error) => {
@@ -384,6 +384,15 @@ pub(super) fn op_ws_upgrade(
                 )
             }
         };
+    // A WebSocket handshake is a subrequest and a hop like any `fetch`: the
+    // edge does not count upgrades, so a Worker that dials its own URL on
+    // every connection was bounded by nothing.
+    if let Err(error) = event_context(scope).charge_subrequest() {
+        return loader_throw(scope, &error);
+    }
+    if let Err(error) = loop_hop(scope, &mut headers) {
+        return loader_throw(scope, &error);
+    }
     let protocols: Vec<String> = headers
         .iter()
         .find(|(name, _)| name.eq_ignore_ascii_case("sec-websocket-protocol"))
@@ -508,6 +517,14 @@ pub(super) fn op_ws_connect(
                 )
             }
         };
+    // The handshake carries only the hop count (see `op_ws_upgrade`).
+    if let Err(error) = event_context(scope).charge_subrequest() {
+        return loader_throw(scope, &error);
+    }
+    let mut headers = Vec::new();
+    if let Err(error) = loop_hop(scope, &mut headers) {
+        return loader_throw(scope, &error);
+    }
     // No cell means a Worker socket: the isolate polls it, so register the
     // queue here on the JS thread and track it against the running request.
     let pull = cell.is_empty().then(|| {
@@ -525,7 +542,7 @@ pub(super) fn op_ws_connect(
                 url,
                 protocols,
                 pull,
-                headers: Vec::new(),
+                headers,
                 want_response: false,
                 target: None,
                 facet,

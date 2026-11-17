@@ -226,19 +226,23 @@ pub struct WorkerInvocationLimits {
     pub sub_requests: Option<u32>,
 }
 
-/// The limits a deployment's config declares (`limits.cpu_ms`). `celld deploy`
+/// The limits a deployment's config declares (`limits.cpu_ms`, `limits.subrequests`). `celld deploy`
 /// validated the value; a manifest written some other way is read with the
 /// same bound, and a value outside it is ignored rather than trusted.
 pub fn deployment_resource_limits(metadata: &serde_json::Value) -> Option<WorkerInvocationLimits> {
-    let cpu_ms = metadata
-        .get("limits")?
-        .get("cpu_ms")?
-        .as_u64()
-        .filter(|ms| (1..=deploy::MAX_CPU_MS).contains(ms))?;
-    Some(WorkerInvocationLimits {
-        cpu_ms: u32::try_from(cpu_ms).ok(),
-        sub_requests: None,
-    })
+    let limits = metadata.get("limits")?;
+    let read = |key: &str, max: u64| {
+        limits
+            .get(key)?
+            .as_u64()
+            .filter(|value| (1..=max).contains(value))
+            .and_then(|value| u32::try_from(value).ok())
+    };
+    let limits = WorkerInvocationLimits {
+        cpu_ms: read("cpu_ms", deploy::MAX_CPU_MS),
+        sub_requests: read("subrequests", deploy::MAX_SUBREQUESTS),
+    };
+    (limits.cpu_ms.is_some() || limits.sub_requests.is_some()).then_some(limits)
 }
 
 /// One operation on a Worker entrypoint. A property read has no arguments,

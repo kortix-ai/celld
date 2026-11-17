@@ -69,22 +69,36 @@ const SUPPORTED_KEYS: &[&str] = &[
 /// a node's thread for longer.
 pub const MAX_CPU_MS: u64 = 300_000;
 
+/// The most subrequests (`fetch`, service binding calls) a Worker may declare
+/// per invocation with `limits.subrequests`: Cloudflare's paid-plan ceiling.
+pub const MAX_SUBREQUESTS: u64 = 10_000_000;
+
 /// Validate the config's `limits`. Only `cpu_ms` is understood; any other key
 /// is refused for the same reason unknown top-level keys are.
 pub(crate) fn read_limits(limits: &Value) -> anyhow::Result<Value> {
     let Some(object) = limits.as_object() else {
         bail!("`limits` must be an object, like {{ \"cpu_ms\": 30000 }}");
     };
-    if let Some(other) = object.keys().find(|key| key.as_str() != "cpu_ms") {
-        bail!("`limits.{other}` is not supported; celld understands `limits.cpu_ms` only");
+    if let Some(other) = object
+        .keys()
+        .find(|key| !matches!(key.as_str(), "cpu_ms" | "subrequests"))
+    {
+        bail!("`limits.{other}` is not supported; celld understands `limits.cpu_ms` and `limits.subrequests`");
     }
-    let Some(cpu_ms) = object.get("cpu_ms") else {
-        return Ok(json!({}));
-    };
-    match cpu_ms.as_u64() {
-        Some(ms @ 1..=MAX_CPU_MS) => Ok(json!({ "cpu_ms": ms })),
-        _ => bail!("`limits.cpu_ms` must be a whole number of milliseconds from 1 to {MAX_CPU_MS}"),
+    let mut read = serde_json::Map::new();
+    if let Some(cpu_ms) = object.get("cpu_ms") {
+        match cpu_ms.as_u64() {
+            Some(ms @ 1..=MAX_CPU_MS) => read.insert("cpu_ms".into(), json!(ms)),
+            _ => bail!("`limits.cpu_ms` must be a whole number of milliseconds from 1 to {MAX_CPU_MS}"),
+        };
     }
+    if let Some(subrequests) = object.get("subrequests") {
+        match subrequests.as_u64() {
+            Some(count @ 1..=MAX_SUBREQUESTS) => read.insert("subrequests".into(), json!(count)),
+            _ => bail!("`limits.subrequests` must be a whole number from 1 to {MAX_SUBREQUESTS}"),
+        };
+    }
+    Ok(Value::Object(read))
 }
 
 /// The Durable Object class every D1 database runs as. It is supplied by the

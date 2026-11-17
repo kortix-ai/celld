@@ -19,7 +19,7 @@ use anyhow::{anyhow, Context as _, Result};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 use v8::{ValueDeserializerHelper, ValueSerializerHelper};
@@ -1901,17 +1901,153 @@ fn default_cpu_limit_ms() -> Option<u32> {
 }
 
 fn parse_cpu_limit_ms(raw: Option<&str>) -> Option<u32> {
+    parse_env_limit("CELLD_CPU_LIMIT_MS", raw, DEFAULT_CPU_LIMIT_MS)
+}
+
+/// A node-wide limit read from the environment: unset or empty is `default`,
+/// `0` is no limit, anything that is not a whole number is `default` with a
+/// warning.
+fn parse_env_limit(name: &str, raw: Option<&str>, default: u32) -> Option<u32> {
     match raw.map(str::trim) {
-        None | Some("") => Some(DEFAULT_CPU_LIMIT_MS),
+        None | Some("") => Some(default),
         Some("0") => None,
         Some(raw) => match raw.parse::<u32>() {
-            Ok(ms) => Some(ms),
+            Ok(value) => Some(value),
             Err(_) => {
-                tracing::warn!(value = raw, default_ms = DEFAULT_CPU_LIMIT_MS, "CELLD_CPU_LIMIT_MS is not a number of milliseconds; using the default");
-                Some(DEFAULT_CPU_LIMIT_MS)
+                tracing::warn!(variable = name, value = raw, default, "not a whole number; using the default");
+                Some(default)
             }
         },
     }
+}
+
+/// The subrequest budget of an invocation whose Worker declares none:
+/// `CELLD_SUBREQUEST_LIMIT`, default 10 000, Cloudflare's default for a paid
+/// Worker. `0` turns it off. `limits.subrequests` replaces it per Worker.
+///
+/// Before this an invocation could make any number of `fetch` and service
+/// binding calls: one request could fan out without bound.
+///
+/// Only a declared limit counts each redirect a followed `fetch` takes, as
+/// Cloudflare does. That needs a client of the invocation's own, so the
+/// default leaves redirects to the shared client's policy (at most 10 per
+/// `fetch`) and keeps its connection pool.
+pub const DEFAULT_SUBREQUEST_LIMIT: u32 = 10_000;
+
+fn default_subrequest_limit() -> Option<u32> {
+    static LIMIT: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        parse_env_limit(
+            "CELLD_SUBREQUEST_LIMIT",
+            std::env::var("CELLD_SUBREQUEST_LIMIT").ok().as_deref(),
+            DEFAULT_SUBREQUEST_LIMIT,
+        )
+    })
+}
+
+/// How many times one request may pass through a Worker before celld refuses
+/// it another hop: `CELLD_MAX_LOOP_HOPS`, default 32. `0` turns it off.
+///
+/// A Worker that fetches its own URL, or two that fetch each other, made a
+/// chain no one could stop: each hop is a new request through the host's
+/// shared edge, each waits on the next, and the CPU limit never fires because
+/// waiting costs none. The count travels in the standard `CDN-Loop` header
+/// (RFC 8586), one `celld` entry per hop: every `fetch`, service binding call,
+/// Durable Object request and Worker Loader call an invocation makes carries
+/// one more entry than the request that started the invocation. celld writes
+/// the entries itself, after the Worker's own headers, so a Worker cannot
+/// reset the count; a client that sends extra entries only shortens its own
+/// request's chain.
+pub const DEFAULT_MAX_LOOP_HOPS: u32 = 32;
+
+/// This node's `CDN-Loop` entry (RFC 8586 `cdn-id`).
+const LOOP_ID: &str = "celld";
+
+fn max_loop_hops() -> Option<u32> {
+    static LIMIT: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        parse_env_limit(
+            "CELLD_MAX_LOOP_HOPS",
+            std::env::var("CELLD_MAX_LOOP_HOPS").ok().as_deref(),
+            DEFAULT_MAX_LOOP_HOPS,
+        )
+    })
+}
+
+fn is_loop_entry(entry: &str) -> bool {
+    entry
+        .split(';')
+        .next()
+        .is_some_and(|id| id.trim().eq_ignore_ascii_case(LOOP_ID))
+}
+
+/// The `celld` entries across every `CDN-Loop` header of a request.
+fn loop_hops_of(headers: &[(String, String)]) -> u32 {
+    let entries = headers
+        .iter()
+        .filter(|(name, _)| name.eq_ignore_ascii_case("cdn-loop"))
+        .flat_map(|(_, value)| value.split(','))
+        .filter(|entry| is_loop_entry(entry))
+        .count();
+    u32::try_from(entries).unwrap_or(u32::MAX)
+}
+
+/// Replace the `celld` entries of `headers` with exactly `hops` of them,
+/// keeping every other CDN's entries in their order.
+fn stamp_loop_hops(headers: &mut Vec<(String, String)>, hops: u32) {
+    let mut entries: Vec<String> = Vec::new();
+    headers.retain(|(name, value)| {
+        if !name.eq_ignore_ascii_case("cdn-loop") {
+            return true;
+        }
+        entries.extend(
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|entry| !entry.is_empty() && !is_loop_entry(entry))
+                .map(str::to_owned),
+        );
+        false
+    });
+    entries.extend((0..hops).map(|_| LOOP_ID.to_owned()));
+    if !entries.is_empty() {
+        headers.push(("cdn-loop".into(), entries.join(", ")));
+    }
+}
+
+/// The hop a request leaving this invocation makes: its `CDN-Loop` carries
+/// one more `celld` entry than the request that started the invocation, or
+/// the request is refused when that passes the node's limit.
+fn next_loop_hop(
+    hops_so_far: u32,
+    limit: Option<u32>,
+    headers: &mut Vec<(String, String)>,
+) -> Result<(), String> {
+    let Some(limit) = limit else {
+        return Ok(());
+    };
+    let hops = hops_so_far.saturating_add(1);
+    if hops > limit {
+        return Err(format!(
+            "Worker request loop: this request has already passed through {hops_so_far} Workers \
+             (CDN-Loop), and celld allows {limit}"
+        ));
+    }
+    stamp_loop_hops(headers, hops);
+    Ok(())
+}
+
+/// `next_loop_hop` for the invocation running in `scope`, logged when refused.
+fn loop_hop(scope: &mut v8::PinScope, headers: &mut Vec<(String, String)>) -> Result<(), String> {
+    let hops_so_far = event_context(scope).loop_hops.load(Ordering::Relaxed);
+    next_loop_hop(hops_so_far, max_loop_hops(), headers).inspect_err(|_| {
+        tracing::warn!(
+            event = "request_loop",
+            script = %actor_runtime_state(scope).script_name,
+            hops = hops_so_far,
+            "a Worker request passed through the hop limit; its next request was refused"
+        );
+    })
 }
 
 /// `limits` with the node's default CPU limit filled in where none was
@@ -1970,7 +2106,7 @@ mod default_cpu_limit_tests {
     }
 
     #[test]
-    fn deploy_accepts_cpu_ms_only() {
+    fn deploy_accepts_cpu_ms_and_subrequests() {
         use crate::deploy::read_limits;
         use serde_json::json;
         assert_eq!(read_limits(&json!({ "cpu_ms": 60000 })).unwrap(), json!({ "cpu_ms": 60000 }));
@@ -1978,7 +2114,15 @@ mod default_cpu_limit_tests {
         assert!(read_limits(&json!({ "cpu_ms": 0 })).is_err());
         assert!(read_limits(&json!({ "cpu_ms": 300001 })).is_err());
         assert!(read_limits(&json!({ "cpu_ms": 1.5 })).is_err());
-        assert!(read_limits(&json!({ "subrequests": 5 })).is_err());
+        assert_eq!(read_limits(&json!({ "subrequests": 5 })).unwrap(), json!({ "subrequests": 5 }));
+        assert_eq!(
+            read_limits(&json!({ "cpu_ms": 100, "subrequests": 10000000 })).unwrap(),
+            json!({ "cpu_ms": 100, "subrequests": 10000000 })
+        );
+        assert!(read_limits(&json!({ "subrequests": 0 })).is_err());
+        assert!(read_limits(&json!({ "subrequests": 10000001 })).is_err());
+        assert!(read_limits(&json!({ "subrequests": "lots" })).is_err());
+        assert!(read_limits(&json!({ "memory_mb": 5 })).is_err());
         assert!(read_limits(&json!(5)).is_err());
     }
 
@@ -1989,6 +2133,83 @@ mod default_cpu_limit_tests {
         assert_eq!(read(serde_json::json!({ "limits": { "cpu_ms": 300001 } })), None);
         assert_eq!(read(serde_json::json!({ "limits": { "cpu_ms": 0 } })), None);
         assert_eq!(read(serde_json::json!({})), None);
+        let subrequests = |value: serde_json::Value| {
+            crate::deployment_resource_limits(&value).and_then(|l| l.sub_requests)
+        };
+        assert_eq!(subrequests(serde_json::json!({ "limits": { "subrequests": 50 } })), Some(50));
+        assert_eq!(subrequests(serde_json::json!({ "limits": { "subrequests": 0 } })), None);
+        assert_eq!(subrequests(serde_json::json!({ "limits": { "subrequests": 10000001 } })), None);
+        assert_eq!(read(serde_json::json!({ "limits": { "subrequests": 50 } })), None);
+    }
+
+    #[test]
+    fn the_subrequest_default_is_read() {
+        let parse = |raw| parse_env_limit("CELLD_SUBREQUEST_LIMIT", raw, DEFAULT_SUBREQUEST_LIMIT);
+        assert_eq!(parse(None), Some(10_000));
+        assert_eq!(parse(Some("0")), None);
+        assert_eq!(parse(Some("50")), Some(50));
+        assert_eq!(parse(Some("x")), Some(10_000));
+    }
+
+    fn header(name: &str, value: &str) -> (String, String) {
+        (name.into(), value.into())
+    }
+
+    #[test]
+    fn loop_hops_count_every_celld_entry_in_every_cdn_loop_header() {
+        assert_eq!(loop_hops_of(&[]), 0);
+        assert_eq!(loop_hops_of(&[header("CDN-Loop", "celld")]), 1);
+        assert_eq!(
+            loop_hops_of(&[
+                header("cdn-loop", "cloudflare, celld; v=1, CELLD"),
+                header("x", "celld"),
+                header("Cdn-Loop", " celld ,fastly"),
+            ]),
+            3
+        );
+        assert_eq!(loop_hops_of(&[header("cdn-loop", "celldx, xcelld")]), 0);
+    }
+
+    #[test]
+    fn a_hop_adds_one_entry_and_keeps_other_cdns() {
+        let mut headers = vec![
+            header("accept", "*/*"),
+            header("CDN-Loop", "cloudflare, celld"),
+            header("cdn-loop", "celld, fastly"),
+        ];
+        next_loop_hop(1, Some(32), &mut headers).unwrap();
+        assert_eq!(
+            headers,
+            vec![header("accept", "*/*"), header("cdn-loop", "cloudflare, fastly, celld, celld")]
+        );
+        assert_eq!(loop_hops_of(&headers), 2);
+    }
+
+    #[test]
+    fn a_worker_cannot_reset_the_count() {
+        // A Worker that sends its own CDN-Loop (or none) still leaves with the
+        // invocation's count plus one.
+        let mut forged = vec![header("cdn-loop", "")];
+        next_loop_hop(5, Some(32), &mut forged).unwrap();
+        assert_eq!(loop_hops_of(&forged), 6);
+        let mut forged = vec![header("cdn-loop", "celld, celld, celld, celld, celld, celld, celld, celld, celld")];
+        next_loop_hop(0, Some(32), &mut forged).unwrap();
+        assert_eq!(loop_hops_of(&forged), 1);
+    }
+
+    #[test]
+    fn the_hop_past_the_limit_is_refused_and_nothing_is_stamped() {
+        let mut headers = vec![header("accept", "*/*")];
+        next_loop_hop(31, Some(32), &mut headers).unwrap();
+        assert_eq!(loop_hops_of(&headers), 32);
+        let mut headers = vec![header("accept", "*/*")];
+        let error = next_loop_hop(32, Some(32), &mut headers).unwrap_err();
+        assert!(error.contains("passed through 32 Workers"), "{error}");
+        assert_eq!(headers, vec![header("accept", "*/*")]);
+        let mut headers = Vec::new();
+        next_loop_hop(1000, None, &mut headers).unwrap();
+        assert!(headers.is_empty(), "detection off leaves the headers alone");
+        assert_eq!(parse_env_limit("CELLD_MAX_LOOP_HOPS", None, DEFAULT_MAX_LOOP_HOPS), Some(32));
     }
 }
 
@@ -4776,6 +4997,7 @@ fn begin<'s>(
         effective_resource_limits(runtime_state.resource_limits, invocation_limits),
         tail_reporting,
     );
+    context.loop_hops.store(loop_hops_of(&headers), Ordering::Relaxed);
     if let Some(stream_id) = body.stream_id() {
         context.own_body_stream(stream_id);
     }
@@ -5287,10 +5509,12 @@ fn start_cell_event<'s>(
     request_id: Option<RequestId>,
     body_stream_id: Option<u64>,
     capture_frames: bool,
+    loop_hops: u32,
     call: impl FnOnce(&mut v8::PinScope<'s, '_>) -> Result<v8::Local<'s, v8::Value>>,
 ) -> Begun {
     let runtime_state = actor_runtime_state(tc);
     let context = IoContext::tracked(&runtime_state);
+    context.loop_hops.store(loop_hops, Ordering::Relaxed);
     if let Some(stream_id) = body_stream_id {
         context.own_body_stream(stream_id);
     }
@@ -5459,6 +5683,7 @@ fn begin_cell(tc: &mut v8::PinScope, job: CellJob, event_time: i64) -> Begun {
                 return Begun::Nothing;
             }
             let body_stream_id = body.stream_id();
+            let hops = loop_hops_of(&headers);
             start_cell_event(
                 tc,
                 &scope,
@@ -5466,6 +5691,7 @@ fn begin_cell(tc: &mut v8::PinScope, job: CellJob, event_time: i64) -> Begun {
                 request_id,
                 body_stream_id,
                 false,
+                hops,
                 |tc| {
                     let f = internal_function(tc, "__dispatchTo")?;
                     // A held body crosses as its bytes; a streamed body crosses as
@@ -5519,6 +5745,7 @@ fn begin_cell(tc: &mut v8::PinScope, job: CellJob, event_time: i64) -> Begun {
                 request_id,
                 None,
                 false,
+                0,
                 |tc| {
                     let f = internal_function(tc, "__dispatchRpc")?;
                     let arguments = [
@@ -5545,7 +5772,7 @@ fn begin_cell(tc: &mut v8::PinScope, job: CellJob, event_time: i64) -> Begun {
                 let _ = reply.send(Err(refusal));
                 return Begun::Nothing;
             }
-            start_cell_event(tc, &scope, Answer::Ack(reply), None, None, false, |tc| {
+            start_cell_event(tc, &scope, Answer::Ack(reply), None, None, false, 0, |tc| {
                 let f = internal_function(tc, "__wsOpen")?;
                 let arguments = [
                     v8::String::new(tc, &scope).unwrap().into(),
@@ -5576,6 +5803,7 @@ fn begin_cell(tc: &mut v8::PinScope, job: CellJob, event_time: i64) -> Begun {
                 None,
                 None,
                 true,
+                0,
                 |tc| {
                     let (name, data) = match data {
                         WsIn::Text(text) => {
@@ -5611,7 +5839,7 @@ fn begin_cell(tc: &mut v8::PinScope, job: CellJob, event_time: i64) -> Begun {
                 let _ = reply.send(Ok(None));
                 return Begun::Nothing;
             }
-            start_cell_event(tc, &scope, Answer::Ack(reply), None, None, false, |tc| {
+            start_cell_event(tc, &scope, Answer::Ack(reply), None, None, false, 0, |tc| {
                 let f = internal_function(tc, "__wsClosed")?;
                 let arguments = [
                     v8::String::new(tc, &scope).unwrap().into(),
@@ -5647,7 +5875,7 @@ fn begin_cell(tc: &mut v8::PinScope, job: CellJob, event_time: i64) -> Begun {
             socket_id,
             terminate,
             reply,
-        } => start_cell_event(tc, &scope, Answer::Ack(reply), None, None, false, |tc| {
+        } => start_cell_event(tc, &scope, Answer::Ack(reply), None, None, false, 0, |tc| {
             register_arm_gate_with_current_event(gate, installed_context());
             if let Some(socket_id) = socket_id {
                 current_context().sockets.lock().unwrap().push(socket_id);
@@ -5738,6 +5966,7 @@ fn fire_alarm_handler(
         request_id,
         None,
         false,
+        0,
         |tc| {
             let f = internal_function(tc, "__fireAlarm")?;
             let arguments = [
@@ -7375,7 +7604,7 @@ fn op_svc_call_impl(
         };
         RequestBody::Bytes(bytes.into())
     };
-    let headers: Vec<(String, String)> =
+    let mut headers: Vec<(String, String)> =
         match serde_json::from_str(&args.get(4).to_rust_string_lossy(scope)) {
             Ok(headers) => headers,
             Err(error) => {
@@ -7387,6 +7616,9 @@ fn op_svc_call_impl(
                 )
             }
         };
+    if let Err(error) = loop_hop(scope, &mut headers) {
+        return loader_throw(scope, &error);
+    }
     let body_guard = match body.stream_id() {
         Some(stream_id) => match current_context().transfer_body_stream(stream_id) {
             Some(guard) => guard,
@@ -7965,7 +8197,7 @@ fn op_loader_fetch(
         };
         RequestBody::Bytes(bytes.into())
     };
-    let headers: Vec<(String, String)> =
+    let mut headers: Vec<(String, String)> =
         match serde_json::from_str(&args.get(4).to_rust_string_lossy(scope)) {
             Ok(headers) => headers,
             Err(error) => {
@@ -7977,6 +8209,9 @@ fn op_loader_fetch(
                 )
             }
         };
+    if let Err(error) = loop_hop(scope, &mut headers) {
+        return loader_throw(scope, &error);
+    }
     let want_tail_report = args.get(9).boolean_value(scope);
     // The caller's AbortSignal cancels through the registry that
     // `__do_call_cancel` already reads, as a service-binding call does. Only a
@@ -8946,7 +9181,7 @@ fn op_do_call_impl(
         };
         RequestBody::Bytes(bytes.into())
     };
-    let headers: Vec<(String, String)> =
+    let mut headers: Vec<(String, String)> =
         match serde_json::from_str(&args.get(5).to_rust_string_lossy(scope)) {
             Ok(headers) => headers,
             Err(error) => {
@@ -8958,6 +9193,9 @@ fn op_do_call_impl(
                 )
             }
         };
+    if let Err(error) = loop_hop(scope, &mut headers) {
+        return loader_throw(scope, &error);
+    }
     let body_guard = match body.stream_id() {
         Some(stream_id) => match current_context().transfer_body_stream(stream_id) {
             Some(guard) => guard,
@@ -9258,6 +9496,9 @@ fn op_fetch(
             )
         }
     };
+    if let Err(error) = loop_hop(scope, &mut headers) {
+        return loader_throw(scope, &error);
+    }
     let redirect = args.get(4).to_rust_string_lossy(scope);
     // The harness passes `true` only when the caller supplied an AbortSignal.
     // An absent argument is `false`, so a direct caller gets the uncancellable
@@ -9331,7 +9572,7 @@ fn op_fetch(
     // Select the client only for direct egress: a broker must not initialize
     // an unused network client and its TLS stack.
     let client = match redirect.as_str() {
-        "follow" if context.subrequest_limit.is_some() => context.redirect_counting_client(),
+        "follow" if context.count_redirects => context.redirect_counting_client(),
         "follow" => HTTP.with(|client| client.clone()),
         "manual" => HTTP_MANUAL.with(|client| client.clone()),
         "error" => HTTP_ERROR.with(|client| client.clone()),
@@ -11239,6 +11480,12 @@ pub struct IoContext {
     /// spend one another's allowance.
     subrequest_limit: Option<u32>,
     subrequests: AtomicUsize,
+    /// Whether the Worker declared its subrequest limit, so a followed
+    /// redirect counts against it (see `DEFAULT_SUBREQUEST_LIMIT`).
+    count_redirects: bool,
+    /// The `celld` entries in the `CDN-Loop` of the request that started this
+    /// invocation (see `DEFAULT_MAX_LOOP_HOPS`).
+    loop_hops: AtomicU32,
     /// A request-scoped client counts redirects against this request. A weak
     /// capture avoids a client/context cycle, and one client retains the
     /// connection pool across all fetches in the invocation.
@@ -11417,8 +11664,12 @@ impl IoContext {
             handed_len: AtomicUsize::new(0),
             handed_wake: tokio::sync::Notify::new(),
             pending_events: Mutex::new(HashSet::new()),
-            subrequest_limit: limits.and_then(|limits| limits.sub_requests),
+            subrequest_limit: limits
+                .and_then(|limits| limits.sub_requests)
+                .or_else(default_subrequest_limit),
             subrequests: AtomicUsize::new(0),
+            count_redirects: limits.and_then(|limits| limits.sub_requests).is_some(),
+            loop_hops: AtomicU32::new(0),
             redirect_client: OnceLock::new(),
             cpu_limit_nanos: limits
                 .and_then(|limits| limits.cpu_ms)
@@ -11451,8 +11702,14 @@ impl IoContext {
             pending_events: Mutex::new(HashSet::new()),
             subrequest_limit: runtime_state
                 .resource_limits
-                .and_then(|limits| limits.sub_requests),
+                .and_then(|limits| limits.sub_requests)
+                .or_else(default_subrequest_limit),
             subrequests: AtomicUsize::new(0),
+            count_redirects: runtime_state
+                .resource_limits
+                .and_then(|limits| limits.sub_requests)
+                .is_some(),
+            loop_hops: AtomicU32::new(0),
             redirect_client: OnceLock::new(),
             cpu_limit_nanos: runtime_state
                 .resource_limits
